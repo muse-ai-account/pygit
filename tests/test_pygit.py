@@ -155,5 +155,127 @@ class PygitTest(unittest.TestCase):
         self.assertNotIn("c.txt", staged)
 
 
+class DiffTest(unittest.TestCase):
+    """pygit diff vs real `git diff`, byte-for-byte, on a pygit repo."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _write(self, path, content):
+        p = self.tmp / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(content.encode() if isinstance(content, str)
+                      else content)
+
+    def _base(self):
+        self._write("f.txt", "one\ntwo\nthree\n")
+        run("init", cwd=self.tmp)
+        run("add", "f.txt", cwd=self.tmp)
+        run("commit", "-m", "base", cwd=self.tmp)
+
+    def _git_diff(self, *args):
+        return git("-c", "core.pager=cat", "diff", *args, cwd=self.tmp)
+
+    def test_plain_diff_matches_real_git(self):
+        self._base()
+        self._write("f.txt", "one\nTWO\nthree\n")
+        self.assertEqual(run("diff", cwd=self.tmp), self._git_diff())
+
+    def test_cached_diff_matches_real_git(self):
+        self._base()
+        self._write("f.txt", "one\nTWO\nthree\n")
+        run("add", "f.txt", cwd=self.tmp)
+        self.assertEqual(run("diff", "--cached", cwd=self.tmp),
+                         self._git_diff("--cached"))
+
+    def test_diff_rev_matches_real_git(self):
+        self._base()
+        self._write("f.txt", "one\nTWO\nthree\n")
+        self.assertEqual(run("diff", "HEAD", cwd=self.tmp),
+                         self._git_diff("HEAD"))
+
+    def test_diff_two_revs_matches_real_git(self):
+        self._base()
+        c1 = git("rev-parse", "HEAD", cwd=self.tmp)
+        self._write("f.txt", "one\nTWO\nthree\n")
+        run("add", "f.txt", cwd=self.tmp)
+        c2 = run("commit", "-m", "second", cwd=self.tmp)
+        self.assertEqual(run("diff", c1, c2, cwd=self.tmp),
+                         self._git_diff(c1, c2))
+
+    def test_no_changes_is_empty(self):
+        self._base()
+        self.assertEqual(run("diff", cwd=self.tmp), "")
+        self.assertEqual(run("diff", "--cached", cwd=self.tmp), "")
+
+    def test_new_staged_file(self):
+        self._base()
+        self._write("new.txt", "hello\n")
+        run("add", "new.txt", cwd=self.tmp)
+        self.assertEqual(run("diff", "--cached", cwd=self.tmp),
+                         self._git_diff("--cached"))
+
+    def test_deleted_in_worktree(self):
+        self._base()
+        (self.tmp / "f.txt").unlink()
+        self.assertEqual(run("diff", cwd=self.tmp), self._git_diff())
+
+    def test_mode_change(self):
+        self._base()
+        (self.tmp / "f.txt").chmod(0o755)
+        run("add", "f.txt", cwd=self.tmp)
+        self.assertEqual(run("diff", "--cached", cwd=self.tmp),
+                         self._git_diff("--cached"))
+
+    def test_mode_and_content_change(self):
+        self._base()
+        (self.tmp / "f.txt").chmod(0o755)
+        self._write("f.txt", "one\nTWO\nthree\n")
+        self.assertEqual(run("diff", cwd=self.tmp), self._git_diff())
+
+    def test_binary(self):
+        self._base()
+        self._write("b.dat", b"a\0b\n")
+        run("add", "b.dat", cwd=self.tmp)
+        run("commit", "-m", "bin", cwd=self.tmp)
+        self._write("b.dat", b"a\0c\n")
+        self.assertEqual(run("diff", cwd=self.tmp), self._git_diff())
+
+    def test_no_trailing_newline(self):
+        self._base()
+        self._write("nonl.txt", "nonl")
+        run("add", "nonl.txt", cwd=self.tmp)
+        run("commit", "-m", "nonl", cwd=self.tmp)
+        self._write("nonl.txt", "nonl2")
+        self.assertEqual(run("diff", cwd=self.tmp), self._git_diff())
+
+    def test_multi_file_and_subdir(self):
+        self._write("a.txt", "a1\na2\na3\n")
+        self._write("sub/b.txt", "b1\nb2\n")
+        run("init", cwd=self.tmp)
+        run("add", "a.txt", "sub/b.txt", cwd=self.tmp)
+        run("commit", "-m", "base", cwd=self.tmp)
+        self._write("a.txt", "a1\nA2\na3\na4\n")
+        self._write("sub/b.txt", "b1\nB2\n")
+        self.assertEqual(run("diff", cwd=self.tmp), self._git_diff())
+
+    def test_two_hunks_when_changes_are_far_apart(self):
+        self._base()
+        lines = [f"line{i}\n" for i in range(30)]
+        self._write("big.txt", "".join(lines))
+        run("add", "big.txt", cwd=self.tmp)
+        run("commit", "-m", "big", cwd=self.tmp)
+        lines[2] = "CHANGED\n"
+        lines[27] = "CHANGED\n"
+        self._write("big.txt", "".join(lines))
+        self.assertEqual(run("diff", cwd=self.tmp), self._git_diff())
+
+    def test_untracked_files_are_invisible(self):
+        self._base()
+        self._write("untracked.txt", "nobody sees me\n")
+        self.assertEqual(run("diff", cwd=self.tmp), "")
+        self.assertEqual(self._git_diff(), "")
+
+
 if __name__ == "__main__":
     unittest.main()

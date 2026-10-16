@@ -27,7 +27,23 @@ python3 pygit.py status                # index vs HEAD vs worktree
 python3 pygit.py commit -m "message"   # snapshots what's staged
 python3 pygit.py log
 python3 pygit.py checkout <commit>     # restore a commit (detaches HEAD)
+python3 pygit.py diff                # worktree vs index
+python3 pygit.py diff --cached       # index vs HEAD
+python3 pygit.py diff <rev> [<rev>]  # worktree vs rev, or rev vs rev
 ```
+
+`diff` prints real unified diffs in git's own format — `diff --git`,
+`index`, `---`/`+++`, `@@` hunks with 3 lines of context, `old mode` /
+`new mode`, `new file mode` / `deleted file mode`, `Binary files ...
+differ`, and `\ No newline at end of file` — byte-identical to
+`git diff` on every case the test suite covers. The engine is a plain
+LCS line-diff (O(n·m), with a whole-file-swap fallback past 4M cells),
+which was humbling to get right: my first backtrack mixed two DP
+conventions and silently double-counted matches, collapsing every diff
+into a whole-file rewrite — caught only because the oracle compares
+against real git, not against myself. Hunk headings follow git's
+fallback for files with no funcname pattern (the line before the hunk);
+language-aware headings like `def foo():` are out of scope.
 
 `checkout` restores the commit's tree into the worktree, rebuilds the
 index from it, and detaches HEAD — like real `git checkout <commit>`.
@@ -42,7 +58,7 @@ in v0.2 and real git only forgave single-file indexes), with a trailing
 SHA-1 checksum. Real `git ls-files --stage` reads it directly, and
 real `git show HEAD:a.txt` shows the *staged* content, not the worktree.
 
-No unstaging / `rm` / branch yet — that's the honest v0.3 boundary.
+No unstaging / `rm` / branch yet — that's the honest v0.4 boundary.
 
 ## What I learned
 Git is mostly a content-addressed object store with three object types
@@ -63,15 +79,26 @@ index said `unknown index entry format`; letting real git write an index
 for the same files and byte-diffing found the 4-byte shift in minutes.
 The oracle isn't just for features.
 
+v0.4 added `diff` and taught me that a diff *engine* and a diff
+*format* are two different compatibilities: git's format has more edge
+cases than I expected (mode-only changes print no `index` line,
+content+mode changes print no mode on the `index` line, binary files
+still get one), and the heading after `@@` is git's funcname fallback —
+the line before the hunk — which I only discovered by watching real git
+do it on a two-hunk diff. Verified empirically, not from docs.
+
 ## Tests
-`python3 -m unittest discover -s tests -v` — 12 tests, all using the real
+`python3 -m unittest discover -s tests -v` — 26 tests, all using the real
 `git` binary as the oracle: blob SHAs match `git hash-object`, real `git
 ls-files --stage` reads my index (including 100755 executable mode and
 multi-file padding), real `git show HEAD:file` proves `commit` snapshots
-staged content, real `git fsck` passes, and after `checkout` real `git
-diff HEAD` / `git diff --cached` are empty. Status 2026-10-16 morning:
-**12/12 passing.**
+staged content, real `git fsck` passes, after `checkout` real `git
+diff HEAD` / `git diff --cached` are empty, and now `pygit diff` output
+is byte-identical to `git diff` across 14 scenarios (plain, --cached,
+rev, rev..rev, new/deleted files, mode changes, binary, missing
+trailing newline, multi-file, two-hunk, untracked-invisible). Status
+2026-10-16 evening: **26/26 passing.**
 
 ## Next (when I come back to it)
-- [ ] `diff` between worktree, index, HEAD
+- [x] `diff` between worktree, index, HEAD — shipped v0.4
 - [ ] `rm` / unstaging; branch refs

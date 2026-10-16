@@ -7,7 +7,7 @@ their SHA-1, exactly like real Git. So real `git cat-file`, `git log`
 and `git fsck` can read repos this tool creates, and vice versa.
 
 Commands: init, hash-object, cat-file, write-tree, commit, log, add,
-         status, checkout
+         status, checkout, diff
 Stdlib only: hashlib, zlib, os, sys, time, struct, pathlib.
 """
 import hashlib
@@ -466,13 +466,241 @@ def cmd_checkout(args):
     print(f"HEAD is now at {oid[:7]} {subject}")
 
 
+# ---------------- diff ----------------
+# Unified diff in git's own format. The diff *engine* is a simple LCS
+# line-diff (O(n*m) time and memory, with a whole-file-swap fallback for
+# pathological inputs — fine for a learning tool); the *format* is the
+# compatibility target, so real `git diff` output is the test oracle.
+#
+#   pygit diff              worktree vs index
+#   pygit diff --cached     index vs HEAD's tree
+#   pygit diff <rev>        worktree vs rev's tree
+#   pygit diff <r1> <r2>    r1's tree vs r2's tree
+# Untracked files never appear in worktree diffs, same as git.
+
+DIFF_CONTEXT = 3
+
+
+def _split_lines(data):
+    """-> (lines, ends_with_newline) as bytes."""
+    if not data:
+        return [], True
+    trailing = data.endswith(b"\n")
+    parts = data.split(b"\n")
+    return (parts[:-1] if trailing else parts), trailing
+
+
+def _opcodes(a, b):
+    """LCS edit script as (tag, i1, i2, j1, j2) runs. Classic prefix DP:
+    dp[i][j] is the LCS length of a[:i] and b[:j], and the backtrack only
+    takes moves that preserve it, so the alignment always has the full
+    LCS length (a suffix-DP draft of this double-counted matches and
+    collapsed to whole-file swaps). Ties prefer inserts while walking
+    backwards, so forwards the deletes come first — git's hunk order;
+    a reorder pass enforces that inside every change run regardless."""
+    n, m = len(a), len(b)
+    if n * m > 4_000_000:
+        return [("replace", 0, n, 0, m)]  # pathological: whole-file swap
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        ai, row, prev = a[i - 1], dp[i], dp[i - 1]
+        for j in range(1, m + 1):
+            row[j] = (prev[j - 1] + 1 if ai == b[j - 1]
+                      else (prev[j] if prev[j] >= row[j - 1] else row[j - 1]))
+    ops, i, j = [], n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and a[i - 1] == b[j - 1]:
+            ops.append(("equal", i - 1, i, j - 1, j))
+            i -= 1
+            j -= 1
+        elif j > 0 and (i == 0 or dp[i][j - 1] >= dp[i - 1][j]):
+            ops.append(("insert", i, i, j - 1, j))
+            j -= 1
+        else:
+            ops.append(("delete", i - 1, i, j, j))
+            i -= 1
+    ops.reverse()
+    fixed, i = [], 0
+    while i < len(ops):
+        if ops[i][0] == "equal":
+            fixed.append(ops[i])
+            i += 1
+            continue
+        j = i
+        while j < len(ops) and ops[j][0] != "equal":
+            j += 1
+        run = ops[i:j]
+        fixed += [op for op in run if op[0] == "delete"]
+        fixed += [op for op in run if op[0] == "insert"]
+        i = j
+    return fixed
+
+
+def _unified_hunks(a, b, a_nl, b_nl):
+    """-> [(old_start, old_count, new_start, new_count, heading, body)];
+    body is a list of (prefix, text, nonewline_marker). The heading is
+    git's fallback for files with no funcname pattern: the single line
+    immediately before the hunk (language-aware headings like
+    `def foo():` are out of scope)."""
+    stream = []  # (prefix, old_idx, new_idx, text)
+    for tag, i1, i2, j1, j2 in _opcodes(a, b):
+        pre = {"equal": " ", "delete": "-", "insert": "+",
+               "replace": "-"}[tag]
+        for k in range(i1, i2):
+            stream.append((pre, k, None, a[k]))
+        if tag in ("insert", "replace"):
+            for k in range(j1, j2):
+                stream.append(("+", None, k, b[k]))
+    changed = [n for n, (p, _, _, _) in enumerate(stream) if p != " "]
+    if not changed:
+        return []
+    groups, cur = [], [changed[0]]
+    for n in changed[1:]:
+        if n - cur[-1] - 1 <= 2 * DIFF_CONTEXT:
+            cur.append(n)
+        else:
+            groups.append(cur)
+            cur = [n]
+    groups.append(cur)
+    hunks = []
+    for g in groups:
+        lo = max(0, g[0] - DIFF_CONTEXT)
+        hi = min(len(stream), g[-1] + DIFF_CONTEXT + 1)
+        old_nr = sum(1 for n in range(lo) if stream[n][0] in " -")
+        new_nr = sum(1 for n in range(lo) if stream[n][0] in " +")
+        heading = (a[old_nr - 1].decode("utf-8", "surrogateescape")
+                   if old_nr > 0 else "")
+        body, o, nn = [], 0, 0
+        for n in range(lo, hi):
+            p, oi, ni, text = stream[n]
+            o += p in " -"
+            nn += p in " +"
+            # The marker belongs to any displayed line that IS the last
+            # line of its side when that side lacks a trailing newline.
+            marker = ((oi == len(a) - 1 and not a_nl and p in " -") or
+                      (ni == len(b) - 1 and not b_nl and p in " +"))
+            body.append((p, text, marker))
+        hunks.append((old_nr, o, new_nr, nn, heading, body))
+    return hunks
+
+
+def _hunk_header(old_nr, o, new_nr, nn, heading=""):
+    def rng(start, count):
+        s = start + 1 if count else start
+        return str(s) if count == 1 else f"{s},{count}"
+    head = f"@@ -{rng(old_nr, o)} +{rng(new_nr, nn)} @@"
+    return head + (f" {heading}" if heading else "")
+
+
+def _is_binary(data):
+    return b"\0" in data[:8000]
+
+
+def _diff_file(path, old, new):
+    """old/new: (mode_int, blob_oid_hex, data_bytes) or None -> lines."""
+    out = [f"diff --git a/{path} b/{path}"]
+    if old is None:  # new file
+        nmode, noid, ndata = new
+        out += [f"new file mode {oct(nmode)[2:]}",
+                f"index 0000000..{noid[:7]}",
+                "--- /dev/null", f"+++ b/{path}"]
+        if _is_binary(ndata):
+            out.append(f"Binary files /dev/null and b/{path} differ")
+            return out
+        n_lines, n_nl = _split_lines(ndata)
+        o_lines, o_nl = [], True
+    elif new is None:  # deleted file
+        omode, ooid, odata = old
+        out += [f"deleted file mode {oct(omode)[2:]}",
+                f"index {ooid[:7]}..0000000",
+                f"--- a/{path}", "+++ /dev/null"]
+        if _is_binary(odata):
+            out.append(f"Binary files a/{path} and /dev/null differ")
+            return out
+        o_lines, o_nl = _split_lines(odata)
+        n_lines, n_nl = [], True
+    else:
+        omode, ooid, odata = old
+        nmode, noid, ndata = new
+        if omode != nmode:
+            out += [f"old mode {oct(omode)[2:]}",
+                    f"new mode {oct(nmode)[2:]}"]
+        if ooid == noid:
+            return out if omode != nmode else []
+        if _is_binary(odata) or _is_binary(ndata):
+            out.append(f"index {ooid[:7]}..{noid[:7]} {oct(nmode)[2:]}")
+            out.append(f"Binary files a/{path} and b/{path} differ")
+            return out
+        idx = f"index {ooid[:7]}..{noid[:7]}"
+        if omode == nmode:
+            idx += f" {oct(nmode)[2:]}"
+        out += [idx, f"--- a/{path}", f"+++ b/{path}"]
+        o_lines, o_nl = _split_lines(odata)
+        n_lines, n_nl = _split_lines(ndata)
+    for old_nr, o, new_nr, nn, heading, body in _unified_hunks(
+            o_lines, n_lines, o_nl, n_nl):
+        out.append(_hunk_header(old_nr, o, new_nr, nn, heading))
+        for p, text, marker in body:
+            out.append(p + text.decode("utf-8", "surrogateescape"))
+            if marker:
+                out.append("\\ No newline at end of file")
+    return out
+
+
+def cmd_diff(args):
+    repo = find_repo()
+    cached = "--cached" in args
+    revs = [a for a in args if a != "--cached"]
+    if (len(revs) > 2 or (cached and revs)
+            or any(a.startswith("-") for a in revs)):
+        raise SystemExit("usage: pygit diff [--cached] [<rev> [<rev>]]")
+
+    def blobs(tree):
+        return {p: (m, o, read_object(o, repo)[1])
+                for p, (m, o) in tree.items()}
+
+    def worktree_blobs():
+        out = {}
+        for path, woid in walk_worktree(repo).items():
+            p = Path(repo) / path
+            data = p.read_bytes()
+            mode = 0o100755 if p.stat().st_mode & 0o111 else 0o100644
+            out[path] = (mode, hash_object(data), data)
+        return out
+
+    head = current_head(repo)
+    if cached:
+        old = blobs(commit_tree(repo, head)) if head else {}
+        new = blobs(read_index(repo))
+    elif len(revs) == 2:
+        old = blobs(commit_tree(repo, resolve_oid(repo, revs[0])))
+        new = blobs(commit_tree(repo, resolve_oid(repo, revs[1])))
+    elif len(revs) == 1:
+        old = blobs(commit_tree(repo, resolve_oid(repo, revs[0])))
+        new = worktree_blobs()
+    else:
+        old = blobs(read_index(repo))
+        new = worktree_blobs()
+
+    lines = []
+    for path in sorted(set(old) | set(new)):
+        o, n = old.get(path), new.get(path)
+        if o and n and o[0] == n[0] and o[1] == n[1]:
+            continue  # identical: nothing to show
+        if o is None and not (cached or len(revs) == 2):
+            continue  # untracked files never appear in worktree diffs
+        lines += _diff_file(path, o, n)
+    if lines:
+        print("\n".join(lines))
+
+
 COMMANDS = {
     "init": cmd_init, "hash-object": cmd_hash_object,
     "cat-file": cmd_cat_file,
     "write-tree": lambda a: print(write_tree(find_repo(), find_repo())),
     "commit": cmd_commit, "log": cmd_log,
     "add": cmd_add, "status": cmd_status,
-    "checkout": cmd_checkout,
+    "checkout": cmd_checkout, "diff": cmd_diff,
 }
 
 
@@ -480,7 +708,7 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(__doc__)
         print("usage: pygit <init|hash-object|cat-file|write-tree|commit|log|"
-              "add|status|checkout> ...")
+              "add|status|checkout|diff> ...")
         return 1
     COMMANDS[sys.argv[1]](sys.argv[2:])
     return 0
