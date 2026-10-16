@@ -92,6 +92,68 @@ class PygitTest(unittest.TestCase):
         self.assertEqual(git("ls-files", "--stage", cwd=self.tmp).split()[0],
                          "100755")
 
+    # ---------------- checkout (v0.3) ----------------
+
+    def make_two_commit_repo(self):
+        (self.tmp / "a.txt").write_text("v1\n")
+        (self.tmp / "sub").mkdir()
+        (self.tmp / "sub" / "b.txt").write_text("keep\n")
+        run("init", cwd=self.tmp)
+        run("add", "a.txt", "sub/b.txt", cwd=self.tmp)
+        first = run("commit", "-m", "first", cwd=self.tmp)
+        (self.tmp / "a.txt").write_text("v2\n")
+        (self.tmp / "c.txt").write_text("new file\n")
+        run("add", "a.txt", "c.txt", cwd=self.tmp)
+        second = run("commit", "-m", "second", cwd=self.tmp)
+        return first, second
+
+    def test_checkout_restores_old_commit(self):
+        first, _ = self.make_two_commit_repo()
+        run("checkout", first, cwd=self.tmp)
+        self.assertEqual((self.tmp / "a.txt").read_text(), "v1\n")
+        self.assertFalse((self.tmp / "c.txt").exists())
+        self.assertEqual((self.tmp / "sub" / "b.txt").read_text(), "keep\n")
+        # real git must agree the worktree matches what we checked out
+        self.assertEqual(git("diff", "HEAD", "--stat", cwd=self.tmp), "")
+        self.assertEqual(git("diff", "--cached", "--stat", cwd=self.tmp), "")
+        git("fsck", cwd=self.tmp)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.tmp), first)
+
+    def test_checkout_accepts_short_oid(self):
+        first, _ = self.make_two_commit_repo()
+        run("checkout", first[:7], cwd=self.tmp)
+        self.assertEqual((self.tmp / "a.txt").read_text(), "v1\n")
+
+    def test_checkout_refuses_to_clobber_local_changes(self):
+        first, _ = self.make_two_commit_repo()
+        (self.tmp / "a.txt").write_text("precious unsaved edit\n")
+        r = subprocess.run([sys.executable, str(PYGIT), "checkout", first],
+                           cwd=self.tmp, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("would be overwritten", r.stderr)
+        # the file must be untouched by the aborted checkout
+        self.assertEqual((self.tmp / "a.txt").read_text(),
+                         "precious unsaved edit\n")
+
+    def test_checkout_refuses_untracked_overwrite(self):
+        first, second = self.make_two_commit_repo()
+        run("checkout", first, cwd=self.tmp)  # c.txt now absent
+        (self.tmp / "c.txt").write_text("my own c.txt\n")
+        r = subprocess.run([sys.executable, str(PYGIT), "checkout", second],
+                           cwd=self.tmp, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("untracked file would be overwritten", r.stderr)
+        self.assertEqual((self.tmp / "c.txt").read_text(), "my own c.txt\n")
+
+    def test_checkout_updates_index_readable_by_real_git(self):
+        first, _ = self.make_two_commit_repo()
+        run("checkout", first, cwd=self.tmp)
+        staged = git("ls-files", "--stage", cwd=self.tmp)
+        self.assertIn("a.txt", staged)
+        self.assertIn(git("hash-object", str(self.tmp / "a.txt"), cwd=self.tmp),
+                      staged)
+        self.assertNotIn("c.txt", staged)
+
 
 if __name__ == "__main__":
     unittest.main()

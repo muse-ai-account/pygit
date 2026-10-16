@@ -6,7 +6,8 @@ Git-compatible on purpose: objects are zlib-compressed
 their SHA-1, exactly like real Git. So real `git cat-file`, `git log`
 and `git fsck` can read repos this tool creates, and vice versa.
 
-Commands: init, hash-object, cat-file, write-tree, commit, log, add, status
+Commands: init, hash-object, cat-file, write-tree, commit, log, add,
+         status, checkout
 Stdlib only: hashlib, zlib, os, sys, time, struct, pathlib.
 """
 import hashlib
@@ -190,7 +191,11 @@ def read_index(repo):
             end = body.index(b"\0", pos)
             name = body[pos:end]
             pos = end + 1
-        pos += (8 - (pos % 8)) % 8  # NUL-pad entry to 8-byte boundary
+        # NUL-pad the ENTRY (62 + namelen + 1) to an 8-byte boundary,
+        # not the absolute file offset: entry-relative alignment is what
+        # real git uses, and the header's 12 bytes would shift it.
+        entry_len = 62 + len(name) + 1
+        pos += (8 - (entry_len % 8)) % 8
         entries[name.decode("utf-8", "surrogateescape")] = (mode, oid)
     return entries
 
@@ -211,7 +216,8 @@ def write_index(repo, entries):
         body += bytes.fromhex(oidhex)
         body += struct.pack(">H", flags)
         body += nb + b"\0"
-        body += b"\0" * ((8 - (len(body) % 8)) % 8)
+        entry_len = 62 + len(nb) + 1  # pad the entry, not the file offset
+        body += b"\0" * ((8 - (entry_len % 8)) % 8)
     body += hashlib.sha1(bytes(body)).digest()
     (Path(repo) / ".git" / "index").write_bytes(bytes(body))
 
@@ -353,12 +359,120 @@ def cmd_status(args):
     print("\n".join(staged + unstaged + untracked))
 
 
+
+
+# ---------------- checkout ----------------
+# Restores a commit's tree into the worktree and syncs the index, like
+# `git checkout <commit>` (which detaches HEAD — so does this).
+# Refuses when the checkout would silently destroy local work, using the
+# same rule as real git: any file the checkout must change that differs
+# locally from HEAD (staged, unstaged, or an untracked file the checkout
+# would overwrite) blocks it with an error listing the files.
+
+def resolve_oid(repo, prefix):
+    """Full commit oid from HEAD/@, a full oid, or a unique prefix."""
+    if prefix in ("HEAD", "@"):
+        oid = current_head(repo)
+        if not oid:
+            raise SystemExit("fatal: HEAD is unborn")
+        return oid
+    matches = []
+    objs = Path(repo) / ".git" / "objects"
+    for d in objs.iterdir():
+        if len(d.name) == 2 and d.is_dir():
+            for f in d.iterdir():
+                oid = d.name + f.name
+                if oid.startswith(prefix):
+                    matches.append(oid)
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise SystemExit(f"fatal: unknown revision '{prefix}'")
+    raise SystemExit(f"fatal: short oid '{prefix}' is ambiguous")
+
+
+def commit_tree(repo, oid):
+    """-> {relpath: (mode_int, blob_oid_hex)} for the tree of a commit."""
+    obj_type, payload = read_object(oid, repo)
+    if obj_type != "commit":
+        raise SystemExit(f"fatal: {oid[:7]} is a {obj_type}, not a commit")
+    tree_line = payload.decode().splitlines()[0]
+    return flatten_tree(tree_line.split()[1], repo)
+
+
+def cmd_checkout(args):
+    if not args:
+        raise SystemExit("usage: pygit checkout <commit>")
+    repo = find_repo()
+    oid = resolve_oid(repo, args[0])
+    target = commit_tree(repo, oid)
+    head = current_head(repo)
+    head_map = commit_tree(repo, head) if head else {}
+    index = read_index(repo)
+    worktree = walk_worktree(repo)
+
+    def clean(path):
+        """True when the local file matches HEAD exactly (index+worktree)."""
+        h = head_map.get(path)
+        expected = h[1] if h else None
+        i = index.get(path)
+        iblob = i[1] if i else None
+        wblob = worktree.get(path)
+        return iblob == expected and wblob == expected
+
+    conflicts = []
+    for path in sorted(set(head_map) | set(target)):
+        h, t = head_map.get(path), target.get(path)
+        if h == t:
+            continue  # checkout wouldn't touch it: nothing to lose
+        wblob = worktree.get(path)
+        if (h is None and index.get(path) is None and wblob is not None
+                and path in target):
+            conflicts.append(f"untracked file would be overwritten: {path}")
+        elif not clean(path):
+            conflicts.append(f"locally modified: {path}")
+    if conflicts:
+        raise SystemExit("error: your local changes would be overwritten "
+                         "by checkout:\n\t" + "\n\t".join(conflicts) +
+                         "\nabort checkout")
+
+    # Apply: delete files HEAD has that the target lacks, write target blobs.
+    for path in sorted(head_map):
+        if path not in target:
+            p = Path(repo) / path
+            if p.is_file():
+                p.unlink()
+            # prune directories left empty, up to the repo root
+            d = p.parent
+            while d != Path(repo) and d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+                d = d.parent
+    entries = {}
+    for path in sorted(target):
+        mode, blob = target[path]
+        p = Path(repo) / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _, payload = read_object(blob, repo)
+        p.write_bytes(payload)
+        os.chmod(p, 0o755 if mode == 0o100755 else 0o644)
+        imode, _, st = index_entry(repo, path)
+        entries[path] = (imode, blob, st)
+    write_index(repo, entries)
+
+    # Detach HEAD, like real `git checkout <commit>`.
+    (Path(repo) / ".git" / "HEAD").write_text(oid + "\n")
+    _, payload = read_object(oid, repo)
+    subject = payload.decode().split("\n\n", 1)[1].strip().splitlines()[0]
+    print(f"HEAD is now at {oid[:7]} {subject}")
+
+
 COMMANDS = {
     "init": cmd_init, "hash-object": cmd_hash_object,
     "cat-file": cmd_cat_file,
     "write-tree": lambda a: print(write_tree(find_repo(), find_repo())),
     "commit": cmd_commit, "log": cmd_log,
     "add": cmd_add, "status": cmd_status,
+    "checkout": cmd_checkout,
 }
 
 
@@ -366,7 +480,7 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(__doc__)
         print("usage: pygit <init|hash-object|cat-file|write-tree|commit|log|"
-              "add|status> ...")
+              "add|status|checkout> ...")
         return 1
     COMMANDS[sys.argv[1]](sys.argv[2:])
     return 0
