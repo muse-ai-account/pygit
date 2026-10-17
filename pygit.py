@@ -7,7 +7,7 @@ their SHA-1, exactly like real Git. So real `git cat-file`, `git log`
 and `git fsck` can read repos this tool creates, and vice versa.
 
 Commands: init, hash-object, cat-file, write-tree, commit, log, add,
-         status, checkout, diff, rm, restore
+         status, checkout, diff, rm, restore, branch
 Stdlib only: hashlib, zlib, os, sys, time, struct, pathlib.
 """
 import hashlib
@@ -138,7 +138,14 @@ def cmd_commit(args):
 
 def cmd_log(args):
     repo = find_repo()
-    oid = current_head(repo)
+    # decorations: which branches point at each commit, and where HEAD is
+    tips = {}
+    for name in list_branches(repo):
+        tips.setdefault(branch_ref(repo, name).read_text().strip(),
+                        []).append(name)
+    head_oid = current_head(repo)
+    current = head_branch(repo)
+    oid = head_oid
     while oid:
         obj_type, payload = read_object(oid, repo)
         assert obj_type == "commit"
@@ -147,7 +154,12 @@ def cmd_log(args):
         for line in head.decode().splitlines():
             if line.startswith("parent "):
                 parent = line[7:]
-        print(f"commit {oid}")
+        deco = []
+        if oid == head_oid:
+            deco.append(f"HEAD -> {current}" if current else "HEAD")
+        deco.extend(b for b in tips.get(oid, []) if b != current)
+        suffix = f" ({', '.join(deco)})" if deco else ""
+        print(f"commit {oid}{suffix}")
         print(f"    {message.decode().strip()}")
         print()
         oid = parent
@@ -481,6 +493,74 @@ def cmd_restore(args):
 # locally from HEAD (staged, unstaged, or an untracked file the checkout
 # would overwrite) blocks it with an error listing the files.
 
+# ---------------- branches ----------------
+# Branches are just files: .git/refs/heads/<name> holds the tip commit oid.
+# HEAD is either "ref: refs/heads/<name>" (attached) or a bare oid (detached).
+
+def head_branch(repo):
+    """Name of the branch HEAD points at, or None if HEAD is detached."""
+    head = (Path(repo) / ".git" / "HEAD").read_text().strip()
+    if head.startswith("ref: refs/heads/"):
+        return head[len("ref: refs/heads/"):]
+    return None
+
+
+def branch_ref(repo, name):
+    return Path(repo) / ".git" / "refs" / "heads" / name
+
+
+def list_branches(repo):
+    heads = Path(repo) / ".git" / "refs" / "heads"
+    names = []
+    if heads.is_dir():
+        for p in heads.rglob("*"):
+            if p.is_file() and p.read_text().strip():
+                names.append(p.relative_to(heads).as_posix())
+    return sorted(names)
+
+
+def valid_branch_name(name):
+    """Name rules probed empirically against `git branch` (git 2.43):
+    no leading dash, none of :?^~*\\[ space or control chars, no '..',
+    no '@{', no leading/trailing '/' or '//', no component starting or
+    ending with '.', no component ending in '.lock'. '@' alone is valid."""
+    if not name or name.startswith("-"):
+        return False
+    bad = set(":?^~*\\[ ") | {chr(c) for c in list(range(32)) + [127]}
+    if any(ch in bad for ch in name):
+        return False
+    if ".." in name or "@{" in name:
+        return False
+    if name.startswith("/") or name.endswith("/") or "//" in name:
+        return False
+    for comp in name.split("/"):
+        if (not comp or comp.startswith(".") or comp.endswith(".")
+                or comp.endswith(".lock")):
+            return False
+    return True
+
+
+def _parents(repo, oid):
+    obj_type, payload = read_object(oid, repo)
+    assert obj_type == "commit"
+    return [line[7:] for line in payload.decode().splitlines()
+            if line.startswith("parent ")]
+
+
+def is_ancestor(repo, maybe_ancestor, oid):
+    """True when maybe_ancestor is reachable from oid via parent links."""
+    seen, stack = set(), [oid]
+    while stack:
+        cur = stack.pop()
+        if cur == maybe_ancestor:
+            return True
+        if cur in seen:
+            continue
+        seen.add(cur)
+        stack.extend(_parents(repo, cur))
+    return False
+
+
 def resolve_oid(repo, prefix):
     """Full commit oid from HEAD/@, a full oid, or a unique prefix."""
     if prefix in ("HEAD", "@"):
@@ -503,6 +583,94 @@ def resolve_oid(repo, prefix):
     raise SystemExit(f"fatal: short oid '{prefix}' is ambiguous")
 
 
+def resolve_rev(repo, rev):
+    """Branch name first (git prefers the ref), then oid resolution."""
+    ref = branch_ref(repo, rev)
+    if ref.is_file():
+        return ref.read_text().strip()
+    return resolve_oid(repo, rev)
+
+
+BRANCH_USAGE = ("usage: pygit branch [-d|-D] <name> [...] | "
+                  "[--show-current] | [--] [<name>]")
+
+
+def cmd_branch(args):
+    repo = find_repo()
+    args = list(args)
+    if args and args[0] == "--":
+        args.pop(0)  # end of options: everything after is a branch name
+    elif args and args[0].startswith("--"):
+        if args[0] not in ("--delete", "--show-current"):
+            raise SystemExit(f"error: unknown option `{args[0][2:]}'\n"
+                             f"{BRANCH_USAGE}")
+    elif args and args[0].startswith("-") and args[0] not in ("-d", "-D"):
+        raise SystemExit(f"error: unknown switch `{args[0][1:]}'\n"
+                         f"{BRANCH_USAGE}")
+    if args and args[0] in ("-d", "--delete", "-D"):
+        force = args[0] == "-D"
+        names = args[1:]
+        if names and names[0] == "--":
+            names.pop(0)
+        if not names:
+            raise SystemExit(BRANCH_USAGE)
+        for name in names:
+            if name.startswith("-"):
+                raise SystemExit(f"error: unknown switch `{name[1:]}'\n"
+                                 f"{BRANCH_USAGE}")
+            _delete_branch(repo, name, force)
+        return
+    if args and args[0] == "--show-current":
+        branch = head_branch(repo)
+        if branch:
+            print(branch)
+        return
+    if not args:
+        branches = list_branches(repo)
+        current = head_branch(repo)
+        lines = []
+        if current is None and current_head(repo):
+            # Detached. Real git consults the reflog here ("detached at"
+            # / "detached from"); pygit keeps no reflog, and with none
+            # present git prints exactly this.
+            lines.append("* (no branch)")
+        for name in branches:
+            lines.append(("* " if name == current else "  ") + name)
+        if lines:
+            print("\n".join(lines))
+        return
+    name = args[0]
+    if not valid_branch_name(name):
+        raise SystemExit(f"fatal: '{name}' is not a valid branch name")
+    ref = branch_ref(repo, name)
+    if ref.is_file():
+        raise SystemExit(f"fatal: a branch named '{name}' already exists")
+    oid = current_head(repo)
+    if not oid:
+        raise SystemExit(f"fatal: not a valid object name: "
+                         f"'{head_branch(repo) or 'HEAD'}'")
+    ref.parent.mkdir(parents=True, exist_ok=True)
+    ref.write_text(oid + "\n")
+
+
+def _delete_branch(repo, name, force):
+    ref = branch_ref(repo, name)
+    if not ref.is_file():
+        raise SystemExit(f"error: branch '{name}' not found")
+    if head_branch(repo) == name:
+        raise SystemExit(f"error: cannot delete branch '{name}' used by "
+                         f"worktree at '{repo}'")
+    if not force:
+        tip = ref.read_text().strip()
+        head = current_head(repo)
+        if head and not is_ancestor(repo, tip, head):
+            raise SystemExit(
+                f"error: the branch '{name}' is not fully merged.\n"
+                f"If you are sure you want to delete it, run "
+                f"'pygit branch -D {name}'")
+    ref.unlink()
+
+
 def commit_tree(repo, oid):
     """-> {relpath: (mode_int, blob_oid_hex)} for the tree of a commit."""
     obj_type, payload = read_object(oid, repo)
@@ -512,19 +680,15 @@ def commit_tree(repo, oid):
     return flatten_tree(tree_line.split()[1], repo)
 
 
-def cmd_checkout(args):
-    if not args:
-        raise SystemExit("usage: pygit checkout <commit>")
-    repo = find_repo()
-    oid = resolve_oid(repo, args[0])
-    target = commit_tree(repo, oid)
-    head = current_head(repo)
-    head_map = commit_tree(repo, head) if head else {}
+def _switch_conflicts(repo, head_oid, target_oid):
+    """[(kind, path)] checkout would destroy: kind is 'untracked' or
+    'modified'. Paths the target wouldn't touch are never conflicts."""
+    target = commit_tree(repo, target_oid)
+    head_map = commit_tree(repo, head_oid) if head_oid else {}
     index = read_index(repo)
     worktree = walk_worktree(repo)
 
     def clean(path):
-        """True when the local file matches HEAD exactly (index+worktree)."""
         h = head_map.get(path)
         expected = h[1] if h else None
         i = index.get(path)
@@ -540,22 +704,24 @@ def cmd_checkout(args):
         wblob = worktree.get(path)
         if (h is None and index.get(path) is None and wblob is not None
                 and path in target):
-            conflicts.append(f"untracked file would be overwritten: {path}")
+            conflicts.append(("untracked", path))
         elif not clean(path):
-            conflicts.append(f"locally modified: {path}")
-    if conflicts:
-        raise SystemExit("error: your local changes would be overwritten "
-                         "by checkout:\n\t" + "\n\t".join(conflicts) +
-                         "\nabort checkout")
+            conflicts.append(("modified", path))
+    return conflicts
 
-    # Apply: delete files HEAD has that the target lacks, write target blobs.
+
+def _materialize_tree(repo, target):
+    """Delete files the old tree had that the target lacks, write the
+    target's blobs, and rebuild the index from them."""
+    head_map = commit_tree(repo, current_head(repo)) if current_head(repo) \
+        else {}
+    index = read_index(repo)
     for path in sorted(head_map):
         if path not in target:
             p = Path(repo) / path
             if p.is_file():
                 p.unlink()
-            # prune directories left empty, up to the repo root
-            d = p.parent
+            d = p.parent  # prune directories left empty, up to repo root
             while d != Path(repo) and d.is_dir() and not any(d.iterdir()):
                 d.rmdir()
                 d = d.parent
@@ -571,11 +737,70 @@ def cmd_checkout(args):
         entries[path] = (imode, blob, st)
     write_index(repo, entries)
 
-    # Detach HEAD, like real `git checkout <commit>`.
+
+def _checkout_oid(repo, oid):
+    """Detached checkout of a commit oid, like `git checkout <sha>`."""
+    conflicts = _switch_conflicts(repo, current_head(repo), oid)
+    if conflicts:
+        msgs = [f"untracked file would be overwritten: {p}"
+                if k == "untracked" else f"locally modified: {p}"
+                for k, p in conflicts]
+        raise SystemExit("error: your local changes would be overwritten "
+                         "by checkout:\n\t" + "\n\t".join(msgs) +
+                         "\nabort checkout")
+    _materialize_tree(repo, commit_tree(repo, oid))
     (Path(repo) / ".git" / "HEAD").write_text(oid + "\n")
     _, payload = read_object(oid, repo)
     subject = payload.decode().split("\n\n", 1)[1].strip().splitlines()[0]
     print(f"HEAD is now at {oid[:7]} {subject}")
+
+
+def _checkout_branch(repo, name, new=False):
+    tip = branch_ref(repo, name).read_text().strip()
+    current = head_branch(repo)
+    if current == name:
+        print(f"Already on '{name}'", file=sys.stderr)
+        return
+    conflicts = _switch_conflicts(repo, current_head(repo), tip)
+    if conflicts:
+        paths = "\n\t".join(p for _, p in conflicts)
+        raise SystemExit(
+            "error: Your local changes to the following files would be "
+            f"overwritten by checkout:\n\t{paths}\n"
+            "Please commit your changes or stash them before you switch "
+            "branches.\nAborting")
+    _materialize_tree(repo, commit_tree(repo, tip))
+    (Path(repo) / ".git" / "HEAD").write_text(f"ref: refs/heads/{name}\n")
+    msg = f"Switched to a new branch '{name}'" if new \
+        else f"Switched to branch '{name}'"
+    print(msg, file=sys.stderr)
+
+
+def cmd_checkout(args):
+    if not args:
+        raise SystemExit("usage: pygit checkout [-b] <branch|commit>")
+    repo = find_repo()
+    if args[0] == "-b":
+        if len(args) != 2:
+            raise SystemExit("usage: pygit checkout -b <new-branch>")
+        name = args[1]
+        if not valid_branch_name(name):
+            raise SystemExit(f"fatal: '{name}' is not a valid branch name")
+        if branch_ref(repo, name).is_file():
+            raise SystemExit(f"fatal: a branch named '{name}' already exists")
+        oid = current_head(repo)
+        if not oid:
+            raise SystemExit("fatal: not a valid object name: "
+                             f"'{head_branch(repo) or 'HEAD'}'")
+        ref = branch_ref(repo, name)
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_text(oid + "\n")
+        _checkout_branch(repo, name, new=True)
+        return
+    if branch_ref(repo, args[0]).is_file():
+        _checkout_branch(repo, args[0])
+        return
+    _checkout_oid(repo, resolve_oid(repo, args[0]))
 
 
 # ---------------- diff ----------------
@@ -785,10 +1010,10 @@ def cmd_diff(args):
         old = blobs(commit_tree(repo, head)) if head else {}
         new = blobs(read_index(repo))
     elif len(revs) == 2:
-        old = blobs(commit_tree(repo, resolve_oid(repo, revs[0])))
-        new = blobs(commit_tree(repo, resolve_oid(repo, revs[1])))
+        old = blobs(commit_tree(repo, resolve_rev(repo, revs[0])))
+        new = blobs(commit_tree(repo, resolve_rev(repo, revs[1])))
     elif len(revs) == 1:
-        old = blobs(commit_tree(repo, resolve_oid(repo, revs[0])))
+        old = blobs(commit_tree(repo, resolve_rev(repo, revs[0])))
         new = worktree_blobs()
     else:
         old = blobs(read_index(repo))
@@ -814,6 +1039,7 @@ COMMANDS = {
     "add": cmd_add, "status": cmd_status,
     "checkout": cmd_checkout, "diff": cmd_diff,
     "rm": cmd_rm, "restore": cmd_restore,
+    "branch": cmd_branch,
 }
 
 
@@ -821,7 +1047,7 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(__doc__)
         print("usage: pygit <init|hash-object|cat-file|write-tree|commit|log|"
-              "add|status|checkout|diff|rm|restore> ...")
+              "add|status|checkout|diff|rm|restore|branch> ...")
         return 1
     COMMANDS[sys.argv[1]](sys.argv[2:])
     return 0

@@ -32,6 +32,12 @@ python3 pygit.py diff --cached       # index vs HEAD
 python3 pygit.py diff <rev> [<rev>]  # worktree vs rev, or rev vs rev
 python3 pygit.py rm [--cached] [-f] f.txt   # stage a deletion
 python3 pygit.py restore --staged f.txt     # unstage: index <- HEAD
+python3 pygit.py branch              # list (* current, like git)
+python3 pygit.py branch feat         # create at HEAD
+python3 pygit.py branch -d|-D feat   # delete (refuses unmerged unless -D)
+python3 pygit.py branch --show-current
+python3 pygit.py checkout feat       # switch branches (reattaches HEAD)
+python3 pygit.py checkout -b fresh    # create + switch
 ```
 
 `diff` prints real unified diffs in git's own format — `diff --git`,
@@ -51,7 +57,23 @@ language-aware headings like `def foo():` are out of scope.
 index from it, and detaches HEAD — like real `git checkout <commit>`.
 It refuses (listing the files) when it would destroy local work: any
 file it must change that differs from HEAD, staged or unstaged, or an
-untracked file it would overwrite.
+untracked file it would overwrite. Given a branch name instead,
+`checkout` *switches* to it: HEAD becomes `ref: refs/heads/<name>`
+again, the worktree/index move to the branch tip, and the refusal
+message is git's own branch-switch wording (verified byte-for-byte).
+`checkout -b` creates the branch and switches in one step.
+
+Branches are just ref files (`.git/refs/heads/<name>` holding the tip
+oid) — `branch` lists them exactly like git (current marked `* `,
+detached shows `* (no branch)` when there's no reflog, which is always
+the case in pygit repos since pygit doesn't write reflogs yet), creates
+them with git's name rules (probed empirically: no leading dash, no
+`..`, no `@{`, no `:?^~*\[` or space, no component starting/ending with
+`.`, no `.lock` suffix — and yes, `@` alone is valid, I checked),
+refuses duplicates, and `-d` refuses unmerged branches (ancestor walk
+from HEAD) and the checked-out branch, with git's exact error text.
+`diff` accepts branch names as revs, and `log` decorates commits with
+`(HEAD -> main, feat)`.
 
 The index (`.git/index`) is Git's real binary format — magic `DIRC`,
 version 2, per-file stat data + blob oid + path, each *entry* NUL-padded
@@ -114,8 +136,20 @@ the index blob is HEAD's — pygit's status, which hashes the worktree
 directly instead of trusting the stat cache, reports the semantically
 correct ` M`. Sometimes the student out-gits the teacher.
 
+v0.6 added branches, and the oracle surprised me twice again. First:
+detached `git branch` doesn't say one thing — it says three, depending
+on the reflog: `(HEAD detached at <sha>)` after a real `git checkout
+<sha>`, `(HEAD detached at refs/heads/main)` or `(HEAD detached from
+refs/heads/main)` when the reflog's tip disagrees with HEAD, and
+`(no branch)` when there's no reflog at all. pygit writes no reflogs,
+so the last one is the only state it can produce — and there the output
+is byte-identical. Second: `git branch -- -x` says `fatal: '-x' is not
+a valid branch name` while bare `git branch -x` says `error: unknown
+switch \`x'` — the `--` separator genuinely changes the code path, so
+pygit implements it too.
+
 ## Tests
-`python3 -m unittest discover -s tests -v` — 38 tests, all using the real
+`python3 -m unittest discover -s tests -v` — 61 tests, all using the real
 `git` binary as the oracle: blob SHAs match `git hash-object`, real `git
 ls-files --stage` reads my index (including 100755 executable mode and
 multi-file padding), real `git show HEAD:file` proves `commit` snapshots
@@ -126,11 +160,20 @@ rev, rev..rev, new/deleted files, mode changes, binary, missing
 trailing newline, multi-file, two-hunk, untracked-invisible), `rm`
 mirrors real git's refusal rules on identical scenarios (staged
 changes, local modifications, divergent staged content, `-f` to force),
-and `restore --staged` returns the index to HEAD (verified by real
-`git diff --cached` and `git ls-files`). Status 2026-10-17 morning:
-**38/38 passing.**
+`restore --staged` returns the index to HEAD (verified by real
+`git diff --cached` and `git ls-files`), and branch behavior is
+oracle-checked throughout: `branch` listing byte-identical attached
+and detached, invalid-name/duplicate/unborn errors text-identical,
+`-d` refusals text-identical, checkout switch messages on stderr
+exactly like git, HEAD file byte-identical after a switch
+(`git rev-parse --abbrev-ref HEAD` agrees), and `diff main feat`
+byte-identical to `git diff main feat`. Status 2026-10-17 evening:
+**61/61 passing.**
 
 ## Next (when I come back to it)
 - [x] `diff` between worktree, index, HEAD — shipped v0.4
 - [x] `rm` / unstaging — shipped v0.5
-- [ ] branch refs
+- [x] branch refs — shipped v0.6
+- [ ] reflogs (`.git/logs/HEAD`): would unlock git's full detached-`branch`
+      messages and `git log -g` compat
+- [ ] merge (fast-forward at least): the first command that *combines* history
