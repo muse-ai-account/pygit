@@ -7,7 +7,7 @@ their SHA-1, exactly like real Git. So real `git cat-file`, `git log`
 and `git fsck` can read repos this tool creates, and vice versa.
 
 Commands: init, hash-object, cat-file, write-tree, commit, log, add,
-         status, checkout, diff
+         status, checkout, diff, rm, restore
 Stdlib only: hashlib, zlib, os, sys, time, struct, pathlib.
 """
 import hashlib
@@ -200,6 +200,12 @@ def read_index(repo):
     return entries
 
 
+def _stat_ns(st, sec_attr, ns_attr):
+    """Nanosecond timestamp; fabricated stat_results may lack ns fields."""
+    ns = getattr(st, ns_attr)
+    return ns if ns is not None else int(getattr(st, sec_attr) * 1e9)
+
+
 def write_index(repo, entries):
     """entries: {relpath: (mode_int, blob_oid_hex, os.stat_result)}."""
     body = bytearray(b"DIRC" + struct.pack(">II", INDEX_VERSION,
@@ -210,8 +216,10 @@ def write_index(repo, entries):
         flags = min(len(nb), 0x0FFF)
         body += struct.pack(
             ">10I",
-            st.st_ctime_ns // 1_000_000_000, st.st_ctime_ns % 1_000_000_000,
-            st.st_mtime_ns // 1_000_000_000, st.st_mtime_ns % 1_000_000_000,
+            _stat_ns(st, "st_ctime", "st_ctime_ns") // 1_000_000_000,
+            _stat_ns(st, "st_ctime", "st_ctime_ns") % 1_000_000_000,
+            _stat_ns(st, "st_mtime", "st_mtime_ns") // 1_000_000_000,
+            _stat_ns(st, "st_mtime", "st_mtime_ns") % 1_000_000_000,
             st.st_dev, st.st_ino, mode, st.st_uid, st.st_gid, st.st_size)
         body += bytes.fromhex(oidhex)
         body += struct.pack(">H", flags)
@@ -359,6 +367,110 @@ def cmd_status(args):
     print("\n".join(staged + unstaged + untracked))
 
 
+
+
+# ---------------- rm / restore --staged ----------------
+# `rm` stages a deletion: the path leaves the index and, without
+# --cached, the worktree too. Like real git it refuses (with the same
+# three error wordings) when removing would destroy content the index
+# and HEAD don't already have:
+#   - staged content differs from HEAD, worktree matches index:
+#     "has changes staged in the index" (use --cached or -f)
+#   - worktree file differs from index: "has local modifications"
+#   - staged content matches neither HEAD nor the worktree file:
+#     "staged content different from both the file and the HEAD" (-f)
+# A file already deleted from the worktree rm's fine — nothing to lose.
+# `restore --staged <path>` is the unstage button: the index entry is
+# reset to HEAD's version of the path (or dropped entirely if HEAD
+# never had it). It never touches the worktree.
+
+def cmd_rm(args):
+    force = "-f" in args or "--force" in args
+    cached = "--cached" in args
+    paths = [str(Path(a)) for a in args if not a.startswith("-")]
+    if not paths:
+        raise SystemExit("usage: pygit rm [-f|--cached] <path>...")
+    repo = find_repo()
+    index = read_index_full(repo)
+    head = current_head(repo)
+    head_map = commit_tree(repo, head) if head else {}
+    worktree = walk_worktree(repo)
+    staged, modified, divergent, missing = [], [], [], []
+    for rel in paths:
+        entry = index.get(rel)
+        if entry is None:
+            missing.append(rel)
+            continue
+        _, ioid, _ = entry
+        h = head_map.get(rel)
+        hoid = h[1] if h else None
+        woid = worktree.get(rel)
+        if cached or force:
+            continue
+        if ioid != hoid:
+            (divergent if woid != ioid else staged).append(rel)
+        elif woid is not None and woid != ioid:
+            modified.append(rel)
+    if missing:
+        raise SystemExit(f"fatal: pathspec '{missing[0]}' "
+                         "did not match files")
+    if staged or modified or divergent:
+        lines = []
+        if staged:
+            lines.append("error: the following file has changes "
+                         "staged in the index:")
+            lines += [f"    {p}" for p in staged]
+            lines.append("(use --cached to keep the file, "
+                         "or -f to force removal)")
+        if modified:
+            lines.append("error: the following file has local "
+                         "modifications:")
+            lines += [f"    {p}" for p in modified]
+            lines.append("(use --cached to keep the file, "
+                         "or -f to force removal)")
+        if divergent:
+            lines.append("error: the following file has staged content "
+                         "different from both the\nfile and the HEAD:")
+            lines += [f"    {p}" for p in divergent]
+            lines.append("(use -f to force removal)")
+        raise SystemExit("\n".join(lines))
+    for rel in paths:
+        del index[rel]
+        if not cached:
+            p = Path(repo) / rel
+            if p.is_file():
+                p.unlink()
+        print(f"rm '{rel}'")
+    write_index(repo, index)
+
+
+def cmd_restore(args):
+    if "--staged" not in args:
+        raise SystemExit("usage: pygit restore --staged <path>...")
+    paths = [str(Path(a)) for a in args if a != "--staged"]
+    repo = find_repo()
+    index = read_index_full(repo)
+    head = current_head(repo)
+    head_map = commit_tree(repo, head) if head else {}
+    ops = []  # (path, head_entry_or_None) — validated before applying
+    for rel in paths:
+        h = head_map.get(rel)
+        if h is None and rel not in index:
+            raise SystemExit(f"fatal: pathspec '{rel}' did not match any "
+                             "files known to git")
+        ops.append((rel, h))
+    for rel, h in ops:
+        if h is None:  # never committed: drop it from the index
+            del index[rel]
+        else:
+            # Zero the stat fields, exactly like real git's restore does:
+            # the recorded stat no longer describes the worktree file,
+            # so the next status must re-hash instead of trusting it.
+            hmode, hoid = h
+            index[rel] = (hmode, hoid, os.stat_result(
+                (hmode, 0, 0, 0, 0, 0, 0, 0, 0, 0)))
+        print(f"unstaged {rel}")
+    write_index(repo, index)
 
 
 # ---------------- checkout ----------------
@@ -701,6 +813,7 @@ COMMANDS = {
     "commit": cmd_commit, "log": cmd_log,
     "add": cmd_add, "status": cmd_status,
     "checkout": cmd_checkout, "diff": cmd_diff,
+    "rm": cmd_rm, "restore": cmd_restore,
 }
 
 
@@ -708,7 +821,7 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(__doc__)
         print("usage: pygit <init|hash-object|cat-file|write-tree|commit|log|"
-              "add|status|checkout|diff> ...")
+              "add|status|checkout|diff|rm|restore> ...")
         return 1
     COMMANDS[sys.argv[1]](sys.argv[2:])
     return 0

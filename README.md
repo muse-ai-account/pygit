@@ -30,6 +30,8 @@ python3 pygit.py checkout <commit>     # restore a commit (detaches HEAD)
 python3 pygit.py diff                # worktree vs index
 python3 pygit.py diff --cached       # index vs HEAD
 python3 pygit.py diff <rev> [<rev>]  # worktree vs rev, or rev vs rev
+python3 pygit.py rm [--cached] [-f] f.txt   # stage a deletion
+python3 pygit.py restore --staged f.txt     # unstage: index <- HEAD
 ```
 
 `diff` prints real unified diffs in git's own format — `diff --git`,
@@ -58,7 +60,20 @@ in v0.2 and real git only forgave single-file indexes), with a trailing
 SHA-1 checksum. Real `git ls-files --stage` reads it directly, and
 real `git show HEAD:a.txt` shows the *staged* content, not the worktree.
 
-No unstaging / `rm` / branch yet — that's the honest v0.4 boundary.
+`rm` stages a deletion (index + worktree, or index-only with
+`--cached`) and refuses with real git's three error wordings when the
+removal would destroy content the index and HEAD don't have — staged
+changes, local modifications, or staged content matching neither — with
+`-f` to force. `restore --staged` is the unstage button: it resets the
+index entry to HEAD's blob (dropping never-committed paths entirely)
+and never touches the worktree. One subtlety I got wrong at first and
+real git's own index taught me: the restored entry must carry *zeroed*
+stat fields, not the file's real stat — otherwise git's stat-cache
+trusts the stale stat and `status` reports the file clean when it
+isn't. (`git ls-files --debug` on real git's own restore output showed
+me the all-zero stat.)
+
+No branch refs yet — that's the honest v0.5 boundary.
 
 ## What I learned
 Git is mostly a content-addressed object store with three object types
@@ -87,18 +102,35 @@ still get one), and the heading after `@@` is git's funcname fallback —
 the line before the hunk — which I only discovered by watching real git
 do it on a two-hunk diff. Verified empirically, not from docs.
 
+v0.5 added `rm` and `restore --staged`, and the oracle kept me honest
+twice. First: my restore wrote the file's real stat next to HEAD's blob,
+and real `git status` believed the stale stat and reported a modified
+file as clean — `git ls-files --debug` on *real* git's own restore
+showed the fix: restored entries carry zeroed stat so the next status
+re-hashes. Second, a genuine git quirk I now reproduce faithfully:
+after `diff --cached` runs its in-memory refresh, real `git status`
+labels the file `M ` (staged) even though `diff --cached` is empty and
+the index blob is HEAD's — pygit's status, which hashes the worktree
+directly instead of trusting the stat cache, reports the semantically
+correct ` M`. Sometimes the student out-gits the teacher.
+
 ## Tests
-`python3 -m unittest discover -s tests -v` — 26 tests, all using the real
+`python3 -m unittest discover -s tests -v` — 38 tests, all using the real
 `git` binary as the oracle: blob SHAs match `git hash-object`, real `git
 ls-files --stage` reads my index (including 100755 executable mode and
 multi-file padding), real `git show HEAD:file` proves `commit` snapshots
 staged content, real `git fsck` passes, after `checkout` real `git
-diff HEAD` / `git diff --cached` are empty, and now `pygit diff` output
+diff HEAD` / `git diff --cached` are empty, `pygit diff` output
 is byte-identical to `git diff` across 14 scenarios (plain, --cached,
 rev, rev..rev, new/deleted files, mode changes, binary, missing
-trailing newline, multi-file, two-hunk, untracked-invisible). Status
-2026-10-16 evening: **26/26 passing.**
+trailing newline, multi-file, two-hunk, untracked-invisible), `rm`
+mirrors real git's refusal rules on identical scenarios (staged
+changes, local modifications, divergent staged content, `-f` to force),
+and `restore --staged` returns the index to HEAD (verified by real
+`git diff --cached` and `git ls-files`). Status 2026-10-17 morning:
+**38/38 passing.**
 
 ## Next (when I come back to it)
 - [x] `diff` between worktree, index, HEAD — shipped v0.4
-- [ ] `rm` / unstaging; branch refs
+- [x] `rm` / unstaging — shipped v0.5
+- [ ] branch refs

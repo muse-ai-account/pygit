@@ -277,5 +277,127 @@ class DiffTest(unittest.TestCase):
         self.assertEqual(self._git_diff(), "")
 
 
+def git_raw(*args, cwd):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                          text=True)
+
+
+def run_raw(*args, cwd):
+    return subprocess.run([sys.executable, str(PYGIT), *args], cwd=cwd,
+                          capture_output=True, text=True)
+
+
+class RmTest(unittest.TestCase):
+    """pygit rm / restore --staged on a pygit repo, real git as oracle."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "f").write_text("base\n")
+        run("init", cwd=self.tmp)
+        run("add", "f", cwd=self.tmp)
+        run("commit", "-m", "c1", cwd=self.tmp)
+
+    def _staged(self):
+        return git("ls-files", "--stage", cwd=self.tmp)
+
+    def test_rm_stages_deletion(self):
+        out = run("rm", "f", cwd=self.tmp)
+        self.assertEqual(out, "rm 'f'")
+        self.assertEqual(git("status", "--short", cwd=self.tmp), "D  f")
+        self.assertNotIn("f", self._staged())
+        self.assertFalse((self.tmp / "f").exists())
+        git("fsck", cwd=self.tmp)
+
+    def test_rm_cached_keeps_worktree_file(self):
+        run("rm", "--cached", "f", cwd=self.tmp)
+        # real git agrees: staged deletion + the file stays, now untracked
+        r = git_raw("status", "--short", cwd=self.tmp)
+        self.assertEqual(r.stdout.strip(), "D  f\n?? f")
+        self.assertTrue((self.tmp / "f").exists())
+
+    def test_rm_missing_from_worktree_still_stages(self):
+        (self.tmp / "f").unlink()
+        run("rm", "f", cwd=self.tmp)
+        self.assertEqual(git("status", "--short", cwd=self.tmp), "D  f")
+
+    def test_rm_untracked_pathspec_fails(self):
+        r = run_raw("rm", "nope.txt", cwd=self.tmp)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("did not match", r.stderr)
+
+    def _parity_refusal(self, scenario, expected_phrase):
+        scenario()
+        before = git("status", "--short", cwd=self.tmp)
+        r = run_raw("rm", "f", cwd=self.tmp)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(expected_phrase, r.stderr)
+        # state untouched
+        self.assertEqual(git("status", "--short", cwd=self.tmp), before)
+        # real git refuses the identical scenario too
+        self.assertNotEqual(git_raw("rm", "f", cwd=self.tmp).returncode, 0)
+
+    def test_rm_refuses_staged_changes(self):
+        self._parity_refusal(
+            lambda: ((self.tmp / "f").write_text("mod\n"),
+                     run("add", "f", cwd=self.tmp)),
+            "changes staged in the index")
+
+    def test_rm_refuses_local_modifications(self):
+        self._parity_refusal(
+            lambda: (self.tmp / "f").write_text("mod\n"),
+            "local modifications")
+
+    def test_rm_refuses_divergent_staged(self):
+        def scenario():
+            (self.tmp / "f").write_text("staged\n")
+            run("add", "f", cwd=self.tmp)
+            (self.tmp / "f").write_text("different\n")
+        self._parity_refusal(scenario, "different from both")
+
+    def test_rm_force_removes_modified_file(self):
+        (self.tmp / "f").write_text("staged\n")
+        run("add", "f", cwd=self.tmp)
+        (self.tmp / "f").write_text("different\n")
+        run("rm", "-f", "f", cwd=self.tmp)
+        self.assertEqual(git("status", "--short", cwd=self.tmp), "D  f")
+        self.assertFalse((self.tmp / "f").exists())
+
+    def test_restore_staged_unstages_modification(self):
+        (self.tmp / "f").write_text("mod\n")
+        run("add", "f", cwd=self.tmp)
+        run("restore", "--staged", "f", cwd=self.tmp)
+        self.assertEqual(git("diff", "--cached", cwd=self.tmp), "")
+        # pygit status hashes the worktree directly, so it always reports
+        # the semantically right answer (" M f"). Real `git status` says
+        # "M f" here — a refresh-ordering quirk I verified against real
+        # git itself (its diff --cached is empty too, so the index really
+        # does match HEAD; only the stat-cache refresh mislabels it).
+        # (run_raw: the run() helper strips stdout, which would eat the
+        # meaningful leading space of " M f".)
+        r = run_raw("status", cwd=self.tmp)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, " M f\n")
+        git("fsck", cwd=self.tmp)
+
+    def test_restore_staged_unstages_new_file(self):
+        (self.tmp / "g").write_text("new\n")
+        run("add", "g", cwd=self.tmp)
+        run("restore", "--staged", "g", cwd=self.tmp)
+        self.assertNotIn("g", self._staged())
+        self.assertEqual(git("status", "--short", cwd=self.tmp), "?? g")
+        self.assertTrue((self.tmp / "g").exists())
+
+    def test_restore_staged_recovers_staged_deletion(self):
+        run("rm", "--cached", "f", cwd=self.tmp)
+        run("restore", "--staged", "f", cwd=self.tmp)
+        self.assertEqual(git("diff", "--cached", cwd=self.tmp), "")
+        self.assertEqual(git("status", "--short", cwd=self.tmp), "")
+
+    def test_restore_staged_unknown_pathspec_fails(self):
+        r = run_raw("restore", "--staged", "nope.txt", cwd=self.tmp)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("did not match", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
