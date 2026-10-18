@@ -7,7 +7,7 @@ their SHA-1, exactly like real Git. So real `git cat-file`, `git log`
 and `git fsck` can read repos this tool creates, and vice versa.
 
 Commands: init, hash-object, cat-file, write-tree, commit, log, add,
-         status, checkout, diff, rm, restore, branch
+         status, checkout, diff, rm, restore, branch, reflog, merge
 Stdlib only: hashlib, zlib, os, sys, time, struct, pathlib.
 """
 import hashlib
@@ -115,6 +115,18 @@ def update_head(repo, oid):
         (Path(repo) / ".git" / "HEAD").write_text(oid + "\n")
 
 
+def _make_commit(repo, tree, parents, message):
+    """Write a commit object; parents is a list of oids (one normally,
+    two for a merge). Returns the new commit's oid."""
+    ts = int(time.time())
+    ident = f"Muse <muse@localhost> {ts} +0000"
+    lines = [f"tree {tree}"]
+    lines += [f"parent {p}" for p in parents]
+    lines += [f"author {ident}", f"committer {ident}", "", message]
+    return hash_object("\n".join(lines).encode() + b"\n", "commit",
+                       write=True, repo=repo)
+
+
 def cmd_commit(args):
     msg = args[args.index("-m") + 1] if "-m" in args else "no message"
     repo = find_repo()
@@ -125,14 +137,7 @@ def cmd_commit(args):
     else:      # no index yet: fall back to a whole-worktree snapshot
         tree = write_tree(repo, repo)
     parent = current_head(repo)
-    ts = int(time.time())
-    ident = f"Muse <muse@localhost> {ts} +0000"
-    lines = [f"tree {tree}"]
-    if parent:
-        lines.append(f"parent {parent}")
-    lines += [f"author {ident}", f"committer {ident}", "", msg]
-    oid = hash_object("\n".join(lines).encode() + b"\n", "commit",
-                      write=True, repo=repo)
+    oid = _make_commit(repo, tree, [parent] if parent else [], msg)
     update_head(repo, oid)
     # the reflog: HEAD always, plus the branch log when on a branch.
     # A root commit's message is "commit (initial):" (probed, not "commit:").
@@ -949,6 +954,434 @@ def cmd_checkout(args):
     _checkout_oid(repo, resolve_rev(repo, args[0]))
 
 
+# ---------------- merge ----------------
+# `pygit merge [-m <msg>|--abort] <branch>`, probed against git 2.43
+# (whose default strategy is 'ort'):
+#   their tip ancestor of HEAD -> "Already up to date."
+#   HEAD ancestor of theirs   -> fast-forward ("Updating x..y" +
+#                                "Fast-forward" + diffstat)
+#   otherwise                 -> true three-way merge around the best
+#                                common ancestor
+# A clean true merge writes a two-parent commit ("Merge branch '<b>'"
+# by default), "Merge made by the 'ort' strategy." + diffstat against
+# the first parent, and reflog entries "merge <b>: ..." on HEAD and the
+# branch. The strategy label mirrors git's conventional message (see
+# the simplification note below); pygit's engine is a plain three-way.
+# Conflicts stop the merge: conflict markers go into the worktree,
+# MERGE_HEAD/MERGE_MSG are written, HEAD doesn't move, and it exits 1.
+# Refusals, all probed byte-for-byte: unknown rev ("merge: <rev> - not
+# something we can merge", rc 1); MERGE_HEAD exists (unmerged-files
+# error, rc 128); staged changes on a true merge (two-space file list,
+# "Merge with strategy ort failed.", rc 2); local changes to files the
+# merge would touch (tab-indented list, "Please commit ... Aborting",
+# rc 1); unrelated histories ("refusing to merge unrelated histories",
+# rc 128).
+# Simplifications, documented not silent: no rename detection, no
+# octopus merges, conflicted files keep no stage-1/2/3 index entries
+# (the index keeps HEAD's version, so `status` shows them modified),
+# and there is no `merge --continue` yet — resolve, `add`, `commit`.
+
+MERGE_USAGE = "usage: pygit merge [-m <msg>|--abort] <branch>"
+
+
+def _merge_base(repo, ours, theirs):
+    """Best common ancestor: a common ancestor not reachable from any
+    other common ancestor. Criss-cross histories with several
+    independent best ancestors pick one deterministically (recursive
+    merge is out of scope)."""
+    def ancestors(oid):
+        seen, stack = set(), [oid]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(_parents(repo, cur))
+        return seen
+    common = ancestors(ours) & ancestors(theirs)
+    best = [c for c in common
+            if not any(o != c and is_ancestor(repo, c, o)
+                       for o in common)]
+    return min(best) if best else None
+
+
+def _changed_regions(a, b):
+    """Changed runs of base->new as [(base_start, base_end, new_lines)]."""
+    regions, i, ops = [], 0, _opcodes(a, b)
+    while i < len(ops):
+        if ops[i][0] == "equal":
+            i += 1
+            continue
+        j = i
+        while j < len(ops) and ops[j][0] != "equal":
+            j += 1
+        regions.append((ops[i][1], ops[j - 1][2],
+                        b[ops[i][3]:ops[j - 1][4]]))
+        i = j
+    return regions
+
+
+def _regions_overlap(r, s):
+    if max(r[0], s[0]) < min(r[1], s[1]):
+        return True
+    # two different pure insertions at the same spot conflict
+    return r[0] == r[1] == s[0] == s[1] and r[2] != s[2]
+
+
+def _conflict_block(ours_lines, theirs_lines, name):
+    return ([b"<<<<<<< HEAD"] + ours_lines + [b"======="] +
+            theirs_lines + [b">>>>>>> " + name.encode()])
+
+
+def _merge_bytes(base, ours, theirs, name):
+    """Three-way line merge of file contents. -> (merged_bytes, clean).
+    Non-overlapping changed regions from both sides are applied;
+    overlapping ones become git-style conflict markers."""
+    def split(data):
+        if not data:
+            return [], True
+        lines = data.split(b"\n")
+        trail = data.endswith(b"\n")
+        return (lines[:-1] if trail else lines), trail
+    bl, b_trail = split(base)
+    ol, o_trail = split(ours)
+    tl, t_trail = split(theirs)
+    regs = sorted([(s, e, nl, 0) for s, e, nl in _changed_regions(bl, ol)] +
+                  [(s, e, nl, 1) for s, e, nl in _changed_regions(bl, tl)])
+    out, pos, clean, i = [], 0, True, 0
+    while i < len(regs):
+        cs, ce = regs[i][0], regs[i][1]
+        cluster = [regs[i]]
+        j = i + 1
+        while j < len(regs) and _regions_overlap((cs, ce, cluster[0][2]),
+                                                 regs[j]):
+            cluster.append(regs[j])
+            cs, ce = min(cs, regs[j][0]), max(ce, regs[j][1])
+            j += 1
+        out.extend(bl[pos:cs])
+        if len({r[3] for r in cluster}) == 1:
+            out.extend(cluster[0][2])
+        else:
+            clean = False
+            ours_l = [ln for r in cluster if r[3] == 0 for ln in r[2]]
+            theirs_l = [ln for r in cluster if r[3] == 1 for ln in r[2]]
+            out.extend(_conflict_block(ours_l, theirs_l, name))
+        pos, i = ce, j
+    out.extend(bl[pos:])
+    trail = o_trail if ours != base else (t_trail if theirs != base
+                                          else b_trail)
+    return b"\n".join(out) + (b"\n" if trail else b""), clean
+
+
+def _materialize_changes(repo, head_map, target, index_skip=()):
+    """Like _materialize_tree, but only touches paths that changed
+    between head_map and target — unstaged edits to files the merge
+    doesn't touch survive, exactly like real git. Paths in index_skip
+    (conflicted files) are written to the worktree but keep HEAD's
+    index entry, with zeroed stat so nothing trusts it."""
+    for path in sorted(set(head_map) - set(target)):
+        p = Path(repo) / path
+        if p.is_file():
+            p.unlink()
+        d = p.parent  # prune directories left empty, up to repo root
+        while d != Path(repo) and d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+            d = d.parent
+    for path in sorted(set(target)):
+        if head_map.get(path) == target[path]:
+            continue
+        mode, blob = target[path]
+        p = Path(repo) / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _, payload = read_object(blob, repo)
+        p.write_bytes(payload)
+        os.chmod(p, 0o755 if mode == 0o100755 else 0o644)
+    # rebuild the index: unchanged entries are kept, changed ones are
+    # re-statted, conflict-skipped ones keep HEAD's entry (stat zeroed)
+    old = read_index_full(repo)
+    entries = {}
+    for path in sorted(target):
+        if path in index_skip:
+            h = head_map.get(path)
+            if h:
+                hmode, hoid = h
+                entries[path] = (hmode, hoid, os.stat_result(
+                    (hmode, 0, 0, 0, 0, 0, 0, 0, 0, 0)))
+            continue
+        if head_map.get(path) == target[path]:
+            e = old.get(path)
+            if e is not None and e[2] is not None:
+                entries[path] = e
+                continue
+        mode, blob = target[path]
+        p = Path(repo) / path
+        try:
+            st = p.stat()
+        except OSError:
+            st = os.stat_result(
+                (mode, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        imode = 0o100755 if (st.st_mode & 0o111) else 0o100644
+        entries[path] = (imode, blob, st)
+    write_index(repo, entries)
+
+
+def _print_diffstat(old, new, repo):
+    """old/new: {path: (mode, oid)}. git-style diffstat of new vs old."""
+    paths = sorted(p for p in set(old) | set(new)
+                   if old.get(p) != new.get(p))
+    rows = []
+    for path in paths:
+        o, n = old.get(path), new.get(path)
+        odata = read_object(o[1], repo)[1] if o else b""
+        ndata = read_object(n[1], repo)[1] if n else b""
+        ol, onl = _split_lines(odata)
+        nl, nnl = _split_lines(ndata)
+        added = deleted = 0
+        for _, _, _, _, _, body in _unified_hunks(ol, nl, onl, nnl):
+            for pfx, _, _ in body:
+                if pfx == "+":
+                    added += 1
+                elif pfx == "-":
+                    deleted += 1
+        rows.append((path, added + deleted, added, deleted, o, n))
+    if not rows:
+        return
+    width = max(len(p) for p, _, _, _, _, _ in rows)
+    numw = max(len(str(c)) for _, c, _, _, _, _ in rows)
+    for path, count, added, deleted, _, _ in rows:
+        print(f" {path:<{width}} | {count:>{numw}} "
+              f"{'+' * added}{'-' * deleted}")
+    nfiles = len(rows)
+    total_a = sum(a for _, _, a, _, _, _ in rows)
+    total_d = sum(d for _, _, _, d, _, _ in rows)
+    summary = f" {nfiles} file{'s' if nfiles != 1 else ''} changed"
+    if total_a:
+        summary += f", {total_a} insertion{'s' if total_a != 1 else ''}(+)"
+    if total_d:
+        summary += f", {total_d} deletion{'s' if total_d != 1 else ''}(-)"
+    print(summary)
+    for path, _, _, _, o, n in rows:
+        if o is None:
+            print(f" create mode {oct(n[0])[2:]} {path}")
+        elif n is None:
+            print(f" delete mode {oct(o[0])[2:]} {path}")
+
+
+def _merge_abort(repo):
+    mh = Path(repo) / ".git" / "MERGE_HEAD"
+    if not mh.is_file():
+        print("fatal: There is no merge to abort (MERGE_HEAD missing).",
+              file=sys.stderr)
+        raise SystemExit(128)
+    head = current_head(repo)
+    _materialize_tree(repo, commit_tree(repo, head))
+    mh.unlink()
+    (Path(repo) / ".git" / "MERGE_MSG").unlink(missing_ok=True)
+
+
+def cmd_merge(args):
+    repo = find_repo()
+    args = list(args)
+    if "--abort" in args:
+        if len(args) > 1:
+            raise SystemExit("usage: pygit merge --abort")
+        _merge_abort(repo)
+        return
+    message = None
+    if "-m" in args:
+        i = args.index("-m")
+        if i + 1 >= len(args):
+            raise SystemExit(MERGE_USAGE)
+        message = args[i + 1]
+        del args[i:i + 2]
+    if len(args) != 1 or args[0].startswith("-"):
+        raise SystemExit(MERGE_USAGE)
+    name = args[0]
+    if (Path(repo) / ".git" / "MERGE_HEAD").is_file():
+        print("error: Merging is not possible because you have unmerged "
+              "files.\nhint: Fix them up in the work tree, and then use "
+              "'git add/rm <file>'\nhint: as appropriate to mark resolution "
+              "and make a commit.\nfatal: Exiting because of an unresolved "
+              "conflict.", file=sys.stderr)
+        raise SystemExit(128)
+    try:
+        theirs = resolve_rev(repo, name)
+        if read_object(theirs, repo)[0] != "commit":
+            raise ValueError("not a commit")
+    except (SystemExit, ValueError, OSError):
+        raise SystemExit(f"merge: {name} - not something we can merge")
+    head = current_head(repo)
+    branch = head_branch(repo)
+    strat = "Merge made by the 'ort' strategy."
+    reflog_msg = f"merge {name}: {{}}"
+
+    if head is None:  # unborn HEAD: take their tree wholesale
+        target = commit_tree(repo, theirs)
+        _materialize_tree(repo, target)
+        update_head(repo, theirs)
+        _log_ref(repo, "HEAD", ZERO_OID, theirs,
+                 reflog_msg.format("Fast-forward"))
+        if branch:
+            _log_ref(repo, f"refs/heads/{branch}", ZERO_OID, theirs,
+                     reflog_msg.format("Fast-forward"))
+        print(f"Updating {ZERO_OID[:7]}..{theirs[:7]}\nFast-forward")
+        _print_diffstat({}, target, repo)
+        return
+
+    if is_ancestor(repo, theirs, head):
+        print("Already up to date.")
+        return
+
+    if is_ancestor(repo, head, theirs):  # fast-forward
+        # git prints the "Updating" line before it discovers the
+        # worktree won't allow the fast-forward (probed)
+        print(f"Updating {head[:7]}..{theirs[:7]}")
+        bad = [p for _, p in _switch_conflicts(repo, head, theirs)]
+        if bad:
+            raise SystemExit(
+                "error: Your local changes to the following files would "
+                "be overwritten by merge:\n\t" + "\n\t".join(bad) +
+                "\nPlease commit your changes or stash them before you "
+                "merge.\nAborting")
+        head_map = commit_tree(repo, head)
+        target = commit_tree(repo, theirs)
+        _materialize_changes(repo, head_map, target)
+        (Path(repo) / ".git" / "ORIG_HEAD").write_text(head + "\n")
+        update_head(repo, theirs)
+        _log_ref(repo, "HEAD", head, theirs,
+                 reflog_msg.format("Fast-forward"))
+        if branch:
+            _log_ref(repo, f"refs/heads/{branch}", head, theirs,
+                     reflog_msg.format("Fast-forward"))
+        print("Fast-forward")
+        _print_diffstat(head_map, target, repo)
+        return
+
+    # true merge
+    base = _merge_base(repo, head, theirs)
+    if base is None:
+        print("fatal: refusing to merge unrelated histories",
+              file=sys.stderr)
+        raise SystemExit(128)
+    head_map = commit_tree(repo, head)
+    base_map = commit_tree(repo, base)
+    their_map = commit_tree(repo, theirs)
+    index = read_index(repo)
+    staged = sorted(p for p in set(index) | set(head_map)
+                    if index.get(p) != head_map.get(p))
+    if staged:  # any staged change blocks a true merge (probed, rc 2)
+        print("error: Your local changes to the following files would "
+              "be overwritten by merge:\n  " + "\n  ".join(staged) +
+              "\nMerge with strategy ort failed.", file=sys.stderr)
+        raise SystemExit(2)
+
+    def blob(entry):
+        return read_object(entry[1], repo)[1] if entry else None
+
+    merged, automerging, conflicts = {}, [], []
+    for path in sorted(set(base_map) | set(head_map) | set(their_map)):
+        b, o, t = (base_map.get(path), head_map.get(path),
+                   their_map.get(path))
+        if o == t:
+            if o is not None:
+                merged[path] = o
+            continue
+        if o == b:
+            if t is not None:
+                merged[path] = t
+            continue
+        if t == b:
+            if o is not None:
+                merged[path] = o
+            continue
+        # both sides changed the path
+        mode = o[0] if o is not None and o != b else t[0]
+        bc, oc, tc = blob(b), blob(o), blob(t)
+        if b is None:  # add/add
+            automerging.append(path)
+            content, _ = _merge_bytes(b"", oc, tc, name)
+            conflicts.append((path, "add/add", None))
+        elif o is None or t is None:  # modify/delete
+            if o is None:
+                side, other, keep = "HEAD", name, t
+            else:
+                side, other, keep = name, "HEAD", o
+            merged[path] = keep
+            conflicts.append((path, "modify/delete",
+                              f"{path} deleted in {side} and modified in "
+                              f"{other}.  Version {other} of {path} left "
+                              f"in tree."))
+            continue
+        else:
+            automerging.append(path)
+            content, clean = _merge_bytes(bc, oc, tc, name)
+            if not clean:
+                conflicts.append((path, "content", None))
+        merged[path] = (mode, hash_object(content, "blob",
+                                          write=True, repo=repo))
+
+    # refuse when the merge would clobber local work
+    worktree = walk_worktree(repo)
+    dirty = []
+    for path in sorted(set(merged) | set(head_map)):
+        if merged.get(path) == head_map.get(path):
+            continue
+        h = head_map.get(path)
+        hoid = h[1] if h else None
+        woid = worktree.get(path)
+        if woid is not None and woid != hoid:
+            dirty.append(path)       # locally modified, merge changes it
+        elif woid is None and h is not None and path in merged:
+            dirty.append(path)       # locally deleted, merge keeps it
+    if dirty:
+        # a true merge runs the strategy, so the refusal gains git's
+        # "Merge with strategy ort failed." tail and exits 2 (probed;
+        # the fast-forward path above has neither)
+        print("error: Your local changes to the following files would "
+              "be overwritten by merge:\n\t" + "\n\t".join(dirty) +
+              "\nPlease commit your changes or stash them before you "
+              "merge.\nAborting\nMerge with strategy ort failed.",
+              file=sys.stderr)
+        raise SystemExit(2)
+
+    auto = set(automerging)
+    cmap = {p: (k, d) for p, k, d in conflicts}
+    for path in sorted(auto | set(cmap)):
+        if path in auto:
+            print(f"Auto-merging {path}")
+        if path in cmap:
+            kind, detail = cmap[path]
+            if detail:
+                print(f"CONFLICT ({kind}): {detail}")
+            else:
+                print(f"CONFLICT ({kind}): Merge conflict in {path}")
+
+    if conflicts:
+        _materialize_changes(repo, head_map, merged,
+                             index_skip=[p for p, _, _ in conflicts])
+        (Path(repo) / ".git" / "MERGE_HEAD").write_text(theirs + "\n")
+        (Path(repo) / ".git" / "MERGE_MSG").write_text(
+            f"Merge branch '{name}'\n\n# Conflicts:\n" +
+            "".join(f"#\t{p}\n" for p, _, _ in conflicts))
+        print("Automatic merge failed; fix conflicts and then commit "
+              "the result.")
+        raise SystemExit(1)
+
+    tree = tree_from_index({p: (m, o, None)
+                            for p, (m, o) in merged.items()}, repo)
+    subject = message or f"Merge branch '{name}'"
+    new = _make_commit(repo, tree, [head, theirs], subject)
+    _materialize_changes(repo, head_map, merged)
+    (Path(repo) / ".git" / "ORIG_HEAD").write_text(head + "\n")
+    update_head(repo, new)
+    _log_ref(repo, "HEAD", head, new, reflog_msg.format(strat))
+    if branch:
+        _log_ref(repo, f"refs/heads/{branch}", head, new,
+                 reflog_msg.format(strat))
+    print(strat)
+    _print_diffstat(head_map, merged, repo)
+
+
 # ---------------- diff ----------------
 # Unified diff in git's own format. The diff *engine* is a simple LCS
 # line-diff (O(n*m) time and memory, with a whole-file-swap fallback for
@@ -1185,7 +1618,7 @@ COMMANDS = {
     "add": cmd_add, "status": cmd_status,
     "checkout": cmd_checkout, "diff": cmd_diff,
     "rm": cmd_rm, "restore": cmd_restore,
-    "branch": cmd_branch, "reflog": cmd_reflog,
+    "branch": cmd_branch, "reflog": cmd_reflog, "merge": cmd_merge,
 }
 
 
@@ -1193,7 +1626,7 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(__doc__)
         print("usage: pygit <init|hash-object|cat-file|write-tree|commit|log|"
-              "add|status|checkout|diff|rm|restore|branch|reflog> ...")
+              "add|status|checkout|diff|rm|restore|branch|reflog|merge> ...")
         return 1
     COMMANDS[sys.argv[1]](sys.argv[2:])
     return 0

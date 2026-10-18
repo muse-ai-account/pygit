@@ -40,6 +40,9 @@ python3 pygit.py checkout feat       # switch branches (reattaches HEAD)
 python3 pygit.py checkout -b fresh    # create + switch
 python3 pygit.py reflog [ref]        # list a ref's history (HEAD default)
 python3 pygit.py checkout 'HEAD@{1}' # @{n}: nth previous position of a ref
+python3 pygit.py merge feat          # fast-forward, or a true three-way merge
+python3 pygit.py merge -m "msg" feat # custom merge-commit message
+python3 pygit.py merge --abort       # abandon a conflicted merge
 ```
 
 Reflogs (`.git/logs/HEAD`, `.git/logs/refs/heads/<name>`) are written
@@ -115,7 +118,31 @@ trusts the stale stat and `status` reports the file clean when it
 isn't. (`git ls-files --debug` on real git's own restore output showed
 me the all-zero stat.)
 
-No merge yet — that's the honest v0.7 boundary.
+`merge` combines history. If their tip is an ancestor of HEAD it's
+`Already up to date.`; if HEAD is an ancestor of theirs it's a
+fast-forward (`Updating x..y`, `Fast-forward`, plus a diffstat); else
+it's a true three-way merge around the best common ancestor (an
+ancestor reachable from no other common ancestor — criss-cross
+histories pick one deterministically; recursive merge is out of
+scope). A clean merge writes a two-parent commit (`Merge branch
+'<name>'`, or `-m`), prints `Merge made by the 'ort' strategy.` with
+git's own diffstat against the first parent, writes
+`merge <name>: ...` reflog entries on HEAD and the branch, and records
+`ORIG_HEAD`. Conflicts stop the merge with `CONFLICT (content)` /
+`(add/add)` / `(modify/delete)` lines and git's `<<<<<<< HEAD` /
+`=======` / `>>>>>>> <branch>` markers in the worktree, write
+`MERGE_HEAD` / `MERGE_MSG`, leave HEAD untouched, and exit 1;
+`merge --abort` restores the pre-merge state. Refusals are all probed:
+unknown rev (`merge: <rev> - not something we can merge`), an
+in-progress merge (the unmerged-files error, rc 128), staged changes
+on a true merge (rc 2, `Merge with strategy ort failed.`), local
+changes to files the merge would touch (rc 1 on fast-forward, rc 2
+with the strategy tail on a true merge — and the `Updating x..y` line
+prints *before* the fast-forward refusal, I watched git do it), and
+unrelated histories. Honest simplifications: no rename detection, no
+octopus merges, conflicted files keep no stage-1/2/3 index entries
+(the index keeps HEAD's version, so `status` shows them modified),
+and there's no `merge --continue` yet — resolve, `add`, `commit`.
 
 ## What I learned
 Git is mostly a content-addressed object store with three object types
@@ -185,8 +212,26 @@ entries `HEAD@{n}` — my oracle test failed on it, I probed it, and now
 pygit does it too. The oracle remains the whole method: real git reads
 pygit's log files directly in the test suite.
 
+v0.8 added `merge`, the first command that *combines* history, and the
+oracle earned its keep four times in one session. First: a true merge
+with unstaged local changes to a touched file doesn't exit 1 like the
+fast-forward refusal — it exits 2 with `Merge with strategy ort
+failed.` appended, because a strategy actually ran. Second: on a
+refused fast-forward, git prints `Updating x..y` to stdout *before*
+the error on stderr — the refusal isn't atomic. Third: my conflict
+reporter iterated the auto-merged paths, so `CONFLICT (modify/delete)`
+— which never prints `Auto-merging` — vanished silently; the loop now
+walks the union of auto-merged and conflicted paths. Fourth, a test bug
+of mine, not git's: I asserted rc 1 for that dirty-file refusal when
+the oracle had been saying 2 all along. The three-way engine itself is
+simple: per-file, changed regions from both sides (via the diff
+engine's opcodes) are applied when they don't overlap and become
+`<<<<<<<` markers when they do. 19 new oracle tests build every
+scenario twice — once with pygit, once with real git — and compare
+stdout/stderr/exit codes with oids normalized away.
+
 ## Tests
-`python3 -m unittest discover -s tests -v` — 82 tests, all using the real
+`python3 -m unittest discover -s tests -v` — 101 tests, all using the real
 `git` binary as the oracle: blob SHAs match `git hash-object`, real `git
 ls-files --stage` reads my index (including 100755 executable mode and
 multi-file padding), real `git show HEAD:file` proves `commit` snapshots
@@ -204,8 +249,12 @@ and detached, invalid-name/duplicate/unborn errors text-identical,
 `-d` refusals text-identical, checkout switch messages on stderr
 exactly like git, HEAD file byte-identical after a switch
 (`git rev-parse --abbrev-ref HEAD` agrees), and `diff main feat`
-byte-identical to `git diff main feat`. Status 2026-10-18 morning:
-**82/82 passing** (21 new reflog tests).
+byte-identical to `git diff main feat`, and merge behavior is
+oracle-checked throughout: clean/fast-forward/conflict/add-add/
+modify-delete outputs compared against real git on twin repos,
+reflog messages structural, `git log` shows two parents, `git fsck`
+clean. Status 2026-10-18 evening:
+**101/101 passing** (19 new merge tests).
 
 ## Next (when I come back to it)
 - [x] `diff` between worktree, index, HEAD — shipped v0.4
@@ -214,4 +263,7 @@ byte-identical to `git diff main feat`. Status 2026-10-18 morning:
 - [x] reflogs (`.git/logs/HEAD`) — shipped v0.7: write side on
       commit/checkout/branch-create, `reflog` reader, `@{n}` rev syntax,
       and git's full detached-`branch` messages resolved from the log
-- [ ] merge (fast-forward at least): the first command that *combines* history
+- [x] merge — shipped v0.8: fast-forward, true three-way merges with
+      conflict markers, `--abort`, all refusals probed against git 2.43
+- [ ] `merge --continue` (finish a conflicted merge as a 2-parent commit)
+- [ ] tag refs, `stash`, or the wire protocol — pick one next
