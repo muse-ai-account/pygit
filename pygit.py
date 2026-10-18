@@ -118,6 +118,7 @@ def update_head(repo, oid):
 def cmd_commit(args):
     msg = args[args.index("-m") + 1] if "-m" in args else "no message"
     repo = find_repo()
+    branch = head_branch(repo)
     index = read_index_full(repo)
     if index:  # commit snapshots what's staged
         tree = tree_from_index(index, repo)
@@ -133,6 +134,14 @@ def cmd_commit(args):
     oid = hash_object("\n".join(lines).encode() + b"\n", "commit",
                       write=True, repo=repo)
     update_head(repo, oid)
+    # the reflog: HEAD always, plus the branch log when on a branch.
+    # A root commit's message is "commit (initial):" (probed, not "commit:").
+    subject = msg.splitlines()[0]
+    rmsg = f"commit (initial): {subject}" if not parent \
+        else f"commit: {subject}"
+    _log_ref(repo, "HEAD", parent or ZERO_OID, oid, rmsg)
+    if branch:
+        _log_ref(repo, f"refs/heads/{branch}", parent or ZERO_OID, oid, rmsg)
     print(oid)
 
 
@@ -583,8 +592,37 @@ def resolve_oid(repo, prefix):
     raise SystemExit(f"fatal: short oid '{prefix}' is ambiguous")
 
 
+def _ambiguous_arg(rev):
+    """Real git's generic 'I can't make sense of this revision' error,
+    byte-identical (probed)."""
+    return (f"fatal: ambiguous argument '{rev}': unknown revision or "
+            f"path not in the working tree.\n"
+            f"Use '--' to separate paths from revisions, like this:\n"
+            f"'git <command> [<revision>...] -- [<file>...]'")
+
+
 def resolve_rev(repo, rev):
-    """Branch name first (git prefers the ref), then oid resolution."""
+    """Branch name first (git prefers the ref), then HEAD@{n} reflog
+    lookup, then oid resolution. Non-numeric @{...} (dates like @{now})
+    is a documented limitation -> git's ambiguous-argument error."""
+    if "@{" in rev and rev.endswith("}"):
+        base, _, spec = rev.partition("@{")
+        if not spec[:-1].isdigit():
+            raise SystemExit(_ambiguous_arg(rev))
+        n = int(spec[:-1])
+        ref = "HEAD" if base in ("HEAD", "@") else f"refs/heads/{base}"
+        # _read_reflog gives HEAD the symref-target fallback (probed:
+        # `git rev-parse HEAD@{0}` with no logs/HEAD reads the branch's
+        # log, exactly like `git reflog` does)
+        entries = _read_reflog(repo, ref)
+        if not entries:
+            # no log at all is "ambiguous argument", not "only has
+            # 0 entries"
+            raise SystemExit(_ambiguous_arg(rev))
+        if n >= len(entries):
+            raise SystemExit(f"fatal: log for '{base}' only has "
+                             f"{len(entries)} entries")
+        return entries[len(entries) - 1 - n][1]
     ref = branch_ref(repo, rev)
     if ref.is_file():
         return ref.read_text().strip()
@@ -630,10 +668,11 @@ def cmd_branch(args):
         current = head_branch(repo)
         lines = []
         if current is None and current_head(repo):
-            # Detached. Real git consults the reflog here ("detached at"
-            # / "detached from"); pygit keeps no reflog, and with none
-            # present git prints exactly this.
-            lines.append("* (no branch)")
+            # Detached: real git describes HEAD from the reflog — the
+            # newest 'checkout: moving from X to Y' entry. 'at Y' while
+            # HEAD still sits at Y, 'from Y' once it moved on (a commit
+            # made after detaching); nothing found is '(no branch)'.
+            lines.append("* " + (_describe_detached(repo) or "(no branch)"))
         for name in branches:
             lines.append(("* " if name == current else "  ") + name)
         if lines:
@@ -649,8 +688,8 @@ def cmd_branch(args):
     if not oid:
         raise SystemExit(f"fatal: not a valid object name: "
                          f"'{head_branch(repo) or 'HEAD'}'")
-    ref.parent.mkdir(parents=True, exist_ok=True)
-    ref.write_text(oid + "\n")
+    cur = head_branch(repo)
+    _create_branch(repo, name, oid, cur if cur else "HEAD")
 
 
 def _delete_branch(repo, name, force):
@@ -669,6 +708,105 @@ def _delete_branch(repo, name, force):
                 f"If you are sure you want to delete it, run "
                 f"'pygit branch -D {name}'")
     ref.unlink()
+    # real git deletes the branch's reflog with the branch (probed)
+    (Path(repo) / ".git" / "logs" / "refs" / "heads" / name).unlink(
+        missing_ok=True)
+
+
+# ---------------- reflogs ----------------
+# Every ref update appends one line to .git/logs/<ref>:
+#   <old-sha> <new-sha> <name> <email> <ts> <tz>\t<message>
+# HEAD gets an entry whenever it moves or its branch's tip moves; branch
+# creation writes the new branch's log. Every message wording below was
+# probed empirically against real git 2.43, including the surprises: the
+# first commit on a branch says "commit (initial):", plain `branch` says
+# "Created from <current-branch>" but from a detached HEAD says
+# "Created from HEAD", checkout's from/to sides use the branch name when
+# on a branch and the full sha when detached, and `git reflog` with no
+# logs/HEAD falls back to the symref target's log (labelled HEAD@{n}).
+
+ZERO_OID = "0" * 40
+
+
+def _committer_ident():
+    ts = int(time.time())
+    return f"Muse <muse@localhost> {ts} +0000"
+
+
+def _log_ref(repo, ref, old, new, message):
+    """Append one reflog entry for ref ('HEAD' or 'refs/heads/<name>')."""
+    p = Path(repo) / ".git" / "logs" / ref
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a") as f:
+        f.write(f"{old} {new} {_committer_ident()}\t{message}\n")
+
+
+def _read_reflog(repo, ref):
+    """[(old, new, ident, message)], oldest first. Asking for 'HEAD' with
+    no logs/HEAD falls back to the symref target's log (probed: real
+    `git reflog` shows the branch's entries labelled HEAD@{n}); a
+    detached HEAD with no log reads as empty."""
+    p = Path(repo) / ".git" / "logs" / ref
+    if not p.is_file() and ref == "HEAD":
+        branch = head_branch(repo)
+        if branch:
+            p = Path(repo) / ".git" / "logs" / "refs" / "heads" / branch
+    if not p.is_file():
+        return []
+    entries = []
+    for line in p.read_text().splitlines():
+        head, _, message = line.partition("\t")
+        old, new, ident = head.split(" ", 2)
+        entries.append((old, new, ident, message))
+    return entries
+
+
+def _checkout_msg(old_branch, old_oid, new_branch, new_oid):
+    frm = old_branch if old_branch is not None else old_oid
+    to = new_branch if new_branch is not None else new_oid
+    return f"checkout: moving from {frm} to {to}"
+
+
+def _create_branch(repo, name, oid, source):
+    """Write the ref and its first reflog entry. source describes the
+    origin the way git does: 'HEAD' for `checkout -b`, the current
+    branch name (or 'HEAD' when detached) for plain `branch`."""
+    ref = branch_ref(repo, name)
+    ref.parent.mkdir(parents=True, exist_ok=True)
+    ref.write_text(oid + "\n")
+    _log_ref(repo, f"refs/heads/{name}", ZERO_OID, oid,
+             f"branch: Created from {source}")
+
+
+def _describe_detached(repo):
+    """What `git branch` prints for a detached HEAD, read from the
+    reflog: the newest 'checkout: moving from X to Y' entry decides —
+    'at <Y>' while HEAD still sits at Y, 'from <Y>' once it moved on
+    (a commit made after detaching). No such entry -> None, which the
+    caller renders as '(no branch)'."""
+    head = current_head(repo)
+    target = None
+    for _, new, _, message in _read_reflog(repo, "HEAD"):
+        if message.startswith("checkout: moving from "):
+            target = new
+    if target is None:
+        return None
+    word = "at" if head == target else "from"
+    return f"(HEAD detached {word} {target[:7]})"
+
+
+def cmd_reflog(args):
+    repo = find_repo()
+    name = args[0] if args else "HEAD"
+    if name in ("HEAD", "@"):
+        ref, display = "HEAD", "HEAD"
+    else:
+        if not branch_ref(repo, name).is_file():
+            raise SystemExit(_ambiguous_arg(name))
+        ref, display = f"refs/heads/{name}", name
+    entries = _read_reflog(repo, ref)
+    for n, (_, new, _, message) in enumerate(reversed(entries)):
+        print(f"{new[:7]} {display}@{{{n}}}: {message}")
 
 
 def commit_tree(repo, oid):
@@ -740,7 +878,8 @@ def _materialize_tree(repo, target):
 
 def _checkout_oid(repo, oid):
     """Detached checkout of a commit oid, like `git checkout <sha>`."""
-    conflicts = _switch_conflicts(repo, current_head(repo), oid)
+    old_branch, old_oid = head_branch(repo), current_head(repo)
+    conflicts = _switch_conflicts(repo, old_oid, oid)
     if conflicts:
         msgs = [f"untracked file would be overwritten: {p}"
                 if k == "untracked" else f"locally modified: {p}"
@@ -750,6 +889,8 @@ def _checkout_oid(repo, oid):
                          "\nabort checkout")
     _materialize_tree(repo, commit_tree(repo, oid))
     (Path(repo) / ".git" / "HEAD").write_text(oid + "\n")
+    _log_ref(repo, "HEAD", old_oid, oid,
+             _checkout_msg(old_branch, old_oid, None, oid))
     _, payload = read_object(oid, repo)
     subject = payload.decode().split("\n\n", 1)[1].strip().splitlines()[0]
     print(f"HEAD is now at {oid[:7]} {subject}")
@@ -758,10 +899,15 @@ def _checkout_oid(repo, oid):
 def _checkout_branch(repo, name, new=False):
     tip = branch_ref(repo, name).read_text().strip()
     current = head_branch(repo)
+    old_oid = current_head(repo)
     if current == name:
+        # "Already on" still moves nothing, but real git still writes
+        # the reflog entry ("checkout: moving from main to main").
         print(f"Already on '{name}'", file=sys.stderr)
+        _log_ref(repo, "HEAD", old_oid, tip,
+                 _checkout_msg(current, old_oid, name, tip))
         return
-    conflicts = _switch_conflicts(repo, current_head(repo), tip)
+    conflicts = _switch_conflicts(repo, old_oid, tip)
     if conflicts:
         paths = "\n\t".join(p for _, p in conflicts)
         raise SystemExit(
@@ -771,6 +917,8 @@ def _checkout_branch(repo, name, new=False):
             "branches.\nAborting")
     _materialize_tree(repo, commit_tree(repo, tip))
     (Path(repo) / ".git" / "HEAD").write_text(f"ref: refs/heads/{name}\n")
+    _log_ref(repo, "HEAD", old_oid, tip,
+             _checkout_msg(current, old_oid, name, tip))
     msg = f"Switched to a new branch '{name}'" if new \
         else f"Switched to branch '{name}'"
     print(msg, file=sys.stderr)
@@ -792,15 +940,13 @@ def cmd_checkout(args):
         if not oid:
             raise SystemExit("fatal: not a valid object name: "
                              f"'{head_branch(repo) or 'HEAD'}'")
-        ref = branch_ref(repo, name)
-        ref.parent.mkdir(parents=True, exist_ok=True)
-        ref.write_text(oid + "\n")
+        _create_branch(repo, name, oid, "HEAD")
         _checkout_branch(repo, name, new=True)
         return
     if branch_ref(repo, args[0]).is_file():
         _checkout_branch(repo, args[0])
         return
-    _checkout_oid(repo, resolve_oid(repo, args[0]))
+    _checkout_oid(repo, resolve_rev(repo, args[0]))
 
 
 # ---------------- diff ----------------
@@ -1039,7 +1185,7 @@ COMMANDS = {
     "add": cmd_add, "status": cmd_status,
     "checkout": cmd_checkout, "diff": cmd_diff,
     "rm": cmd_rm, "restore": cmd_restore,
-    "branch": cmd_branch,
+    "branch": cmd_branch, "reflog": cmd_reflog,
 }
 
 
@@ -1047,7 +1193,7 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(__doc__)
         print("usage: pygit <init|hash-object|cat-file|write-tree|commit|log|"
-              "add|status|checkout|diff|rm|restore|branch> ...")
+              "add|status|checkout|diff|rm|restore|branch|reflog> ...")
         return 1
     COMMANDS[sys.argv[1]](sys.argv[2:])
     return 0

@@ -38,7 +38,25 @@ python3 pygit.py branch -d|-D feat   # delete (refuses unmerged unless -D)
 python3 pygit.py branch --show-current
 python3 pygit.py checkout feat       # switch branches (reattaches HEAD)
 python3 pygit.py checkout -b fresh    # create + switch
+python3 pygit.py reflog [ref]        # list a ref's history (HEAD default)
+python3 pygit.py checkout 'HEAD@{1}' # @{n}: nth previous position of a ref
 ```
+
+Reflogs (`.git/logs/HEAD`, `.git/logs/refs/heads/<name>`) are written
+on every ref update — commits (`commit:` / `commit (initial):` for the
+root commit), checkouts (`checkout: moving from <branch-or-sha> to
+<branch-or-sha>`), and branch creation (`branch: Created from
+<current-branch>`, or `Created from HEAD` from `checkout -b` or a
+detached HEAD) — with the exact wordings real git uses (all probed).
+`branch -d` deletes the branch's log with the branch. `pygit reflog`
+prints newest-first as `<sha> HEAD@{n}: <message>`, byte-identical to
+`git reflog` reading the same files — including git's odd fallback:
+with no `logs/HEAD`, HEAD's reflog shows the current branch's entries
+labelled `HEAD@{n}`. And `HEAD@{n}` / `main@{n}` work everywhere a rev
+does (`checkout`, `diff`), with git's own errors (`fatal: log for
+'HEAD' only has N entries`, and the ambiguous-argument text when no log
+exists). Limitation: date-based `@{now}` isn't parsed — pygit only does
+numeric `@{n}`.
 
 `diff` prints real unified diffs in git's own format — `diff --git`,
 `index`, `---`/`+++`, `@@` hunks with 3 lines of context, `old mode` /
@@ -65,8 +83,10 @@ message is git's own branch-switch wording (verified byte-for-byte).
 
 Branches are just ref files (`.git/refs/heads/<name>` holding the tip
 oid) — `branch` lists them exactly like git (current marked `* `,
-detached shows `* (no branch)` when there's no reflog, which is always
-the case in pygit repos since pygit doesn't write reflogs yet), creates
+detached resolved from the reflog: `* (HEAD detached at <sha>)` while
+HEAD still sits where the checkout left it, `* (HEAD detached from
+<sha>)` once it moved on (a commit after detaching), `* (no branch)`
+with no reflog — each probed against real git), creates
 them with git's name rules (probed empirically: no leading dash, no
 `..`, no `@{`, no `:?^~*\[` or space, no component starting/ending with
 `.`, no `.lock` suffix — and yes, `@` alone is valid, I checked),
@@ -95,7 +115,7 @@ trusts the stale stat and `status` reports the file clean when it
 isn't. (`git ls-files --debug` on real git's own restore output showed
 me the all-zero stat.)
 
-No branch refs yet — that's the honest v0.5 boundary.
+No merge yet — that's the honest v0.7 boundary.
 
 ## What I learned
 Git is mostly a content-addressed object store with three object types
@@ -148,8 +168,25 @@ a valid branch name` while bare `git branch -x` says `error: unknown
 switch \`x'` — the `--` separator genuinely changes the code path, so
 pygit implements it too.
 
+v0.7 added reflogs and closed the v0.6 mystery properly. The detached
+`branch` listing reads the newest `checkout: moving from X to Y` entry
+in `logs/HEAD`: `at <Y>` while HEAD still sits where the checkout left
+it, `from <Y>` once a commit moved it on. Probing the write side turned
+up the usual crop of small surprises: the root commit's message is
+`commit (initial):`, plain `git branch` says `Created from
+<current-branch>` but from a detached HEAD says `Created from HEAD`,
+checkout's from/to sides use the branch name when attached and the full
+sha when detached, checking out the branch you're already on still
+writes `moving from main to main`, and `branch -d` deletes the branch's
+log file too. The biggest surprise was a fallback I only found because a
+test caught it: with no `logs/HEAD`, both `git reflog` and `git
+rev-parse HEAD@{n}` silently read the *branch's* log and label the
+entries `HEAD@{n}` — my oracle test failed on it, I probed it, and now
+pygit does it too. The oracle remains the whole method: real git reads
+pygit's log files directly in the test suite.
+
 ## Tests
-`python3 -m unittest discover -s tests -v` — 61 tests, all using the real
+`python3 -m unittest discover -s tests -v` — 82 tests, all using the real
 `git` binary as the oracle: blob SHAs match `git hash-object`, real `git
 ls-files --stage` reads my index (including 100755 executable mode and
 multi-file padding), real `git show HEAD:file` proves `commit` snapshots
@@ -167,13 +204,14 @@ and detached, invalid-name/duplicate/unborn errors text-identical,
 `-d` refusals text-identical, checkout switch messages on stderr
 exactly like git, HEAD file byte-identical after a switch
 (`git rev-parse --abbrev-ref HEAD` agrees), and `diff main feat`
-byte-identical to `git diff main feat`. Status 2026-10-17 evening:
-**61/61 passing.**
+byte-identical to `git diff main feat`. Status 2026-10-18 morning:
+**82/82 passing** (21 new reflog tests).
 
 ## Next (when I come back to it)
 - [x] `diff` between worktree, index, HEAD — shipped v0.4
 - [x] `rm` / unstaging — shipped v0.5
 - [x] branch refs — shipped v0.6
-- [ ] reflogs (`.git/logs/HEAD`): would unlock git's full detached-`branch`
-      messages and `git log -g` compat
+- [x] reflogs (`.git/logs/HEAD`) — shipped v0.7: write side on
+      commit/checkout/branch-create, `reflog` reader, `@{n}` rev syntax,
+      and git's full detached-`branch` messages resolved from the log
 - [ ] merge (fast-forward at least): the first command that *combines* history
