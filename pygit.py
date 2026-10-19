@@ -269,6 +269,7 @@ def index_entry(repo, relpath):
 def cmd_add(args):
     repo = find_repo()
     staged = read_index_full(repo)
+    had = set(staged)
     for name in args:
         rel = str(Path(name))
         full = Path(repo) / rel
@@ -276,9 +277,19 @@ def cmd_add(args):
             mode, oid, st = index_entry(repo, rel)
             staged[rel] = (mode, oid, st)
             print(f"staged {rel}")
+        elif rel in had:
+            # like real git, adding a deleted tracked file stages the
+            # deletion — this is also how a content conflict is
+            # resolved by deleting the file
+            staged.pop(rel, None)
+            print(f"staged {rel}")
         else:
             raise SystemExit(f"fatal: pathspec '{name}' did not match a file")
     write_index(repo, staged)
+    # staging a conflicted path marks it resolved (mirrors git clearing
+    # the unmerged stages)
+    for name in args:
+        _clear_merge_conflict(repo, str(Path(name)))
 
 
 def read_index_full(repo):
@@ -312,6 +323,9 @@ def flatten_tree(oid, repo, prefix=""):
 
 def tree_from_index(entries, repo):
     """Write tree objects for the staged file set; return root tree oid."""
+    if not entries:
+        # no entries at all: git's well-known empty tree
+        return hash_object(b"", "tree", write=True, repo=repo)
     nodes = {}  # dirpath -> {child_name: (mode_bytes, oid_hex)}
     for relpath in sorted(entries):
         mode, oidhex, _ = entries[relpath]
@@ -418,11 +432,19 @@ def cmd_rm(args):
         raise SystemExit("usage: pygit rm [-f|--cached] <path>...")
     repo = find_repo()
     index = read_index_full(repo)
+    # during a conflicted merge, `rm` on an unmerged path stages the
+    # deletion as the resolution (probed: works for content, add/add
+    # and modify/delete alike) — none of the usual refusal checks
+    # apply
+    kinds = (_merge_conflict_kinds(repo)
+             if (Path(repo) / ".git" / "MERGE_HEAD").is_file() else {})
+    unmerged = [p for p in paths if p in kinds]
+    normal = [p for p in paths if p not in unmerged]
     head = current_head(repo)
     head_map = commit_tree(repo, head) if head else {}
     worktree = walk_worktree(repo)
     staged, modified, divergent, missing = [], [], [], []
-    for rel in paths:
+    for rel in normal:
         entry = index.get(rel)
         if entry is None:
             missing.append(rel)
@@ -460,12 +482,19 @@ def cmd_rm(args):
             lines += [f"    {p}" for p in divergent]
             lines.append("(use -f to force removal)")
         raise SystemExit("\n".join(lines))
-    for rel in paths:
+    for rel in normal:
         del index[rel]
         if not cached:
             p = Path(repo) / rel
             if p.is_file():
                 p.unlink()
+        print(f"rm '{rel}'")
+    for rel in unmerged:  # deletion is the resolution
+        p = Path(repo) / rel
+        if p.is_file() and not cached:
+            p.unlink()
+        index.pop(rel, None)
+        _clear_merge_conflict(repo, rel)
         print(f"rm '{rel}'")
     write_index(repo, index)
 
@@ -981,7 +1010,7 @@ def cmd_checkout(args):
 # (the index keeps HEAD's version, so `status` shows them modified),
 # and there is no `merge --continue` yet — resolve, `add`, `commit`.
 
-MERGE_USAGE = "usage: pygit merge [-m <msg>|--abort] <branch>"
+MERGE_USAGE = "usage: pygit merge [-m <msg>|--abort|--continue] <branch>"
 
 
 def _merge_base(repo, ours, theirs):
@@ -1167,6 +1196,97 @@ def _print_diffstat(old, new, repo):
             print(f" delete mode {oct(o[0])[2:]} {path}")
 
 
+def _merge_conflict_kinds(repo):
+    """{path: kind} for merge conflicts not yet resolved. Real git
+    tracks "unmerged" via index stages 1-3; this index format doesn't
+    model stages (it's byte-identical to git 2.43's DIRC v2), so the
+    paths live in .git/MERGE_CONFLICTS instead. `add`/`rm` clear them,
+    exactly mirroring how staging clears unmerged stages."""
+    f = Path(repo) / ".git" / "MERGE_CONFLICTS"
+    if not f.is_file():
+        return {}
+    out = {}
+    for line in f.read_text().splitlines():
+        if ":" in line:
+            p, k = line.rsplit(":", 1)
+            out[p] = k
+    return out
+
+
+def _clear_merge_conflict(repo, rel):
+    f = Path(repo) / ".git" / "MERGE_CONFLICTS"
+    if not f.is_file():
+        return
+    rest = [l for l in f.read_text().splitlines()
+            if l and l.rsplit(":", 1)[0] != rel]
+    if rest:
+        f.write_text("".join(l + "\n" for l in rest))
+    else:
+        f.unlink()
+
+
+def _cleanup_strip(text):
+    """git --cleanup=strip: drop #comment lines, strip trailing
+    whitespace, collapse consecutive blank lines, strip leading and
+    trailing blank lines."""
+    kept = []
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        line = line.rstrip()
+        if line:
+            kept.append(line)
+        elif kept and kept[-1]:
+            kept.append("")
+    while kept and not kept[0]:
+        kept.pop(0)
+    while kept and not kept[-1]:
+        kept.pop()
+    return "\n".join(kept)
+
+
+def _merge_continue(repo):
+    g = Path(repo) / ".git"
+    mh = g / "MERGE_HEAD"
+    if not mh.is_file():
+        print("fatal: There is no merge in progress (MERGE_HEAD missing).",
+              file=sys.stderr)
+        raise SystemExit(128)
+    unmerged = sorted(_merge_conflict_kinds(repo))
+    if unmerged:
+        for p in unmerged:
+            print(f"U\t{p}")
+        print("error: Committing is not possible because you have unmerged "
+              "files.\nhint: Fix them up in the work tree, and then use "
+              "'git add/rm <file>'\nhint: as appropriate to mark resolution "
+              "and make a commit.\nfatal: Exiting because of an unresolved "
+              "conflict.", file=sys.stderr)
+        raise SystemExit(128)
+    theirs = mh.read_text().split()[0]
+    head = current_head(repo)
+    branch = head_branch(repo)
+    index = read_index(repo)
+    tree = tree_from_index({p: (m, o, None) for p, (m, o) in index.items()},
+                           repo)
+    # no editor is ever launched (pygit never launches editors); this
+    # is the EDITOR=true path: MERGE_MSG cleaned with --cleanup=strip,
+    # so the "# Conflicts:" trailer written at conflict time is dropped
+    msgf = g / "MERGE_MSG"
+    msg = _cleanup_strip(msgf.read_text()) if msgf.is_file() else ""
+    new = _make_commit(repo, tree, [p for p in (head, theirs) if p], msg)
+    update_head(repo, new)
+    subject = msg.splitlines()[0] if msg else ""
+    rmsg = f"commit (merge): {subject}"
+    _log_ref(repo, "HEAD", head or ZERO_OID, new, rmsg)
+    if branch:
+        _log_ref(repo, f"refs/heads/{branch}", head or ZERO_OID, new, rmsg)
+    mh.unlink()
+    msgf.unlink(missing_ok=True)
+    (g / "MERGE_CONFLICTS").unlink(missing_ok=True)
+    where = branch if branch else "detached HEAD"
+    print(f"[{where} {new[:7]}] {subject}")
+
+
 def _merge_abort(repo):
     mh = Path(repo) / ".git" / "MERGE_HEAD"
     if not mh.is_file():
@@ -1177,6 +1297,7 @@ def _merge_abort(repo):
     _materialize_tree(repo, commit_tree(repo, head))
     mh.unlink()
     (Path(repo) / ".git" / "MERGE_MSG").unlink(missing_ok=True)
+    (Path(repo) / ".git" / "MERGE_CONFLICTS").unlink(missing_ok=True)
 
 
 def cmd_merge(args):
@@ -1186,6 +1307,17 @@ def cmd_merge(args):
         if len(args) > 1:
             raise SystemExit("usage: pygit merge --abort")
         _merge_abort(repo)
+        return
+    if "--continue" in args:
+        # probed: --abort is checked first ("--abort expects no
+        # arguments" wins over "--continue expects no arguments"),
+        # and --continue takes no arguments at all (rc 129)
+        if len(args) > 1:
+            print("fatal: --continue expects no arguments\n",
+                  file=sys.stderr)
+            print(MERGE_USAGE, file=sys.stderr)
+            raise SystemExit(129)
+        _merge_continue(repo)
         return
     message = None
     if "-m" in args:
@@ -1212,6 +1344,9 @@ def cmd_merge(args):
         raise SystemExit(f"merge: {name} - not something we can merge")
     head = current_head(repo)
     branch = head_branch(repo)
+    # probed: detached HEAD merges say "Merge branch 'x' into HEAD"
+    default_subject = (f"Merge branch '{name}'" +
+                       ("" if branch else " into HEAD"))
     strat = "Merge made by the 'ort' strategy."
     reflog_msg = f"merge {name}: {{}}"
 
@@ -1361,15 +1496,17 @@ def cmd_merge(args):
                              index_skip=[p for p, _, _ in conflicts])
         (Path(repo) / ".git" / "MERGE_HEAD").write_text(theirs + "\n")
         (Path(repo) / ".git" / "MERGE_MSG").write_text(
-            f"Merge branch '{name}'\n\n# Conflicts:\n" +
+            f"{default_subject}\n\n# Conflicts:\n" +
             "".join(f"#\t{p}\n" for p, _, _ in conflicts))
+        (Path(repo) / ".git" / "MERGE_CONFLICTS").write_text(
+            "".join(f"{p}:{k}\n" for p, k, _ in conflicts))
         print("Automatic merge failed; fix conflicts and then commit "
               "the result.")
         raise SystemExit(1)
 
     tree = tree_from_index({p: (m, o, None)
                             for p, (m, o) in merged.items()}, repo)
-    subject = message or f"Merge branch '{name}'"
+    subject = message or default_subject
     new = _make_commit(repo, tree, [head, theirs], subject)
     _materialize_changes(repo, head_map, merged)
     (Path(repo) / ".git" / "ORIG_HEAD").write_text(head + "\n")

@@ -43,6 +43,7 @@ python3 pygit.py checkout 'HEAD@{1}' # @{n}: nth previous position of a ref
 python3 pygit.py merge feat          # fast-forward, or a true three-way merge
 python3 pygit.py merge -m "msg" feat # custom merge-commit message
 python3 pygit.py merge --abort       # abandon a conflicted merge
+python3 pygit.py merge --continue    # finish it after resolving
 ```
 
 Reflogs (`.git/logs/HEAD`, `.git/logs/refs/heads/<name>`) are written
@@ -132,7 +133,27 @@ git's own diffstat against the first parent, writes
 `(add/add)` / `(modify/delete)` lines and git's `<<<<<<< HEAD` /
 `=======` / `>>>>>>> <branch>` markers in the worktree, write
 `MERGE_HEAD` / `MERGE_MSG`, leave HEAD untouched, and exit 1;
-`merge --abort` restores the pre-merge state. Refusals are all probed:
+`merge --abort` restores the pre-merge state, and `merge --continue`
+finishes a conflicted merge once every conflict is resolved: it
+commits the index as a two-parent commit (old HEAD + `MERGE_HEAD`),
+writes `commit (merge): <subject>` reflog entries, removes
+`MERGE_HEAD` / `MERGE_MSG`, and prints `[<branch> <sha>] <subject>`
+(`[detached HEAD <sha>]` when detached). The message is `MERGE_MSG`
+run through `--cleanup=strip`, so the `# Conflicts:` trailer is
+dropped. Refusing while conflicts remain prints git's `U\t<path>`
+lines and the unmerged-files error (rc 128); with no merge in
+progress it's `fatal: There is no merge in progress (MERGE_HEAD
+missing).` (rc 128). Unmerged paths are tracked in
+`.git/MERGE_CONFLICTS` — git uses index stages 1–3 for this, which
+this DIRC-v2 index doesn't model; `add` and `rm` clear entries,
+mirroring how staging clears unmerged stages, and `rm` on an unmerged
+path stages the deletion as the resolution (all probed, including the
+surprise that `rm` works on content conflicts too — an early probe
+misread a typo'd filename as a refusal, and the test oracle caught
+me). Two honest simplifications: detached merges say `Merge branch
+'<name>' into HEAD` like git's, but pygit never launches an editor —
+`--continue` always takes the `EDITOR=true` path. Refusals are all
+probed:
 unknown rev (`merge: <rev> - not something we can merge`), an
 in-progress merge (the unmerged-files error, rc 128), staged changes
 on a true merge (rc 2, `Merge with strategy ort failed.`), local
@@ -142,7 +163,8 @@ prints *before* the fast-forward refusal, I watched git do it), and
 unrelated histories. Honest simplifications: no rename detection, no
 octopus merges, conflicted files keep no stage-1/2/3 index entries
 (the index keeps HEAD's version, so `status` shows them modified),
-and there's no `merge --continue` yet — resolve, `add`, `commit`.
+and `--continue` never launches an editor (always the `EDITOR=true`
+path).
 
 ## What I learned
 Git is mostly a content-addressed object store with three object types
@@ -230,8 +252,26 @@ engine's opcodes) are applied when they don't overlap and become
 scenario twice — once with pygit, once with real git — and compare
 stdout/stderr/exit codes with oids normalized away.
 
+v0.9 finished the merge story with `merge --continue`: resolve, stage,
+continue — a two-parent commit, `commit (merge):` reflog entries,
+`MERGE_HEAD`/`MERGE_MSG` cleaned up, git's `[main <sha>] <subject>`
+announcement. The oracle caught two of my assumptions again. First, an
+early probe had "shown" that `git rm` refuses content-conflict paths
+with a pathspec error — it hadn't; I'd typed the wrong filename and
+the error was real git correctly saying the file didn't exist. `rm`
+stages the deletion as the resolution for every conflict kind, and the
+test now proves it. Second, my own smoke test crashed `--continue`
+after a resolve-by-deletion: `tree_from_index` couldn't build an
+empty tree (a latent bug that also bit the clean-merge path when both
+sides delete everything) — it now returns git's well-known empty tree
+`4b825dc6...`. Unmerged paths are tracked in `.git/MERGE_CONFLICTS`
+because this index format has no stage-1/2/3 entries; `add`/`rm`
+clear them like staging clears unmerged stages, and `add` on a deleted
+tracked file now stages the deletion (real git does this too). 8 new
+oracle tests; the suite is at 109.
+
 ## Tests
-`python3 -m unittest discover -s tests -v` — 101 tests, all using the real
+`python3 -m unittest discover -s tests -v` — 109 tests, all using the real
 `git` binary as the oracle: blob SHAs match `git hash-object`, real `git
 ls-files --stage` reads my index (including 100755 executable mode and
 multi-file padding), real `git show HEAD:file` proves `commit` snapshots

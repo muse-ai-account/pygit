@@ -442,5 +442,220 @@ class MergeTest(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
 
 
+def conflicted():
+    """Twin repos with a content conflict in f.txt after `merge feat`."""
+    py_repo, git_repo = fresh_repos()
+    pcommit(py_repo, {"f.txt": "base\n"}, "A")
+    gcommit(git_repo, {"f.txt": "base\n"}, "A")
+    run("checkout", "-b", "feat", cwd=py_repo)
+    git("checkout", "-qb", "feat", cwd=git_repo, env=git_env())
+    pcommit(py_repo, {"f.txt": "theirs\n"}, "B")
+    gcommit(git_repo, {"f.txt": "theirs\n"}, "B")
+    run("checkout", "main", cwd=py_repo)
+    git("checkout", "-q", "main", cwd=git_repo, env=git_env())
+    pcommit(py_repo, {"f.txt": "ours\n"}, "C")
+    gcommit(git_repo, {"f.txt": "ours\n"}, "C")
+    pr = run_raw("merge", "feat", cwd=py_repo)
+    assert pr.returncode == 1, pr.stderr
+    gr = git_raw("merge", "feat", cwd=git_repo, env=git_env())
+    assert gr.returncode == 1, gr.stderr
+    return py_repo, git_repo
+
+
+def added_added():
+    """Twin repos with an add/add conflict in g.txt after `merge feat`."""
+    py_repo, git_repo = fresh_repos()
+    pcommit(py_repo, {"f.txt": "base\n"}, "A")
+    gcommit(git_repo, {"f.txt": "base\n"}, "A")
+    run("checkout", "-b", "feat", cwd=py_repo)
+    git("checkout", "-qb", "feat", cwd=git_repo, env=git_env())
+    pcommit(py_repo, {"g.txt": "theirs\n"}, "B")
+    gcommit(git_repo, {"g.txt": "theirs\n"}, "B")
+    run("checkout", "main", cwd=py_repo)
+    git("checkout", "-q", "main", cwd=git_repo, env=git_env())
+    pcommit(py_repo, {"g.txt": "ours\n"}, "C")
+    gcommit(git_repo, {"g.txt": "ours\n"}, "C")
+    pr = run_raw("merge", "feat", cwd=py_repo)
+    assert pr.returncode == 1, pr.stderr
+    gr = git_raw("merge", "feat", cwd=git_repo, env=git_env())
+    assert gr.returncode == 1, gr.stderr
+    return py_repo, git_repo
+
+
+def compare_continue(py_repo, git_repo):
+    """pygit never launches editors, so the oracle runs with
+    EDITOR=true (MERGE_MSG used as-is, comments stripped)."""
+    pr = run_raw("merge", "--continue", cwd=py_repo)
+    gr = git_raw("merge", "--continue", cwd=git_repo,
+                 env={**git_env(), "EDITOR": "true"})
+    assert pr.returncode == gr.returncode, (pr, gr)
+    assert norm(pr.stdout) == norm(gr.stdout), (pr.stdout, gr.stdout)
+    assert norm(pr.stderr) == norm(gr.stderr), (pr.stderr, gr.stderr)
+    return pr, gr
+
+
+def resolve_both(py_repo, git_repo, content="resolved\n"):
+    (py_repo / "f.txt").write_text(content)
+    (git_repo / "f.txt").write_text(content)
+    run("add", "f.txt", cwd=py_repo)
+    git("add", "f.txt", cwd=git_repo, env=git_env())
+
+
+class MergeContinueTest(unittest.TestCase):
+    # -- refusals --------------------------------------------------------
+
+    def test_continue_without_merge(self):
+        py_repo, git_repo = diverge()
+        pr = run_raw("merge", "--continue", cwd=py_repo)
+        gr = git_raw("merge", "--continue", cwd=git_repo, env=git_env())
+        self.assertEqual(pr.returncode, gr.returncode)
+        self.assertEqual(pr.returncode, 128)
+        self.assertEqual(pr.stderr, gr.stderr)
+
+    def test_continue_with_arguments(self):
+        py_repo, git_repo = conflicted()
+        pr = run_raw("merge", "--continue", "-m", "x", cwd=py_repo)
+        gr = git_raw("merge", "--continue", "-m", "x", cwd=git_repo,
+                     env=git_env())
+        # git's usage text is pages long; pygit's is one line. The
+        # contract is the fatal line and rc 129.
+        self.assertEqual(pr.returncode, gr.returncode)
+        self.assertEqual(pr.returncode, 129)
+        self.assertEqual(pr.stderr.splitlines()[0],
+                        gr.stderr.splitlines()[0])
+        # nothing happened: the merge is still in progress on both sides
+        self.assertTrue((py_repo / ".git" / "MERGE_HEAD").is_file())
+        self.assertTrue((git_repo / ".git" / "MERGE_HEAD").is_file())
+
+    def test_continue_with_unmerged_files(self):
+        py_repo, git_repo = conflicted()
+        compare_continue(py_repo, git_repo)
+
+    # -- the happy path --------------------------------------------------
+
+    def test_continue_after_resolve(self):
+        py_repo, git_repo = conflicted()
+        old_head = pygit.current_head(str(py_repo))
+        theirs = (py_repo / ".git" / "refs" / "heads" / "feat"
+                  ).read_text().strip()
+        resolve_both(py_repo, git_repo)
+        # a dirty worktree alongside doesn't stop the continue and
+        # isn't swept into the commit (probed)
+        (py_repo / "extra.txt").write_text("dirty\n")
+        (git_repo / "extra.txt").write_text("dirty\n")
+        compare_continue(py_repo, git_repo)
+        new = pygit.current_head(str(py_repo))
+        parents, message = commit_parents_and_message(str(py_repo), new)
+        self.assertEqual(parents, [old_head, theirs])
+        self.assertEqual(message, "Merge branch 'feat'")
+        self.assertEqual(git("status", "--porcelain", cwd=py_repo),
+                         "?? extra.txt")
+        (py_repo / "extra.txt").unlink()
+        (git_repo / "extra.txt").unlink()
+        # merge state is gone everywhere
+        for name in ("MERGE_HEAD", "MERGE_MSG", "MERGE_CONFLICTS"):
+            self.assertFalse((py_repo / ".git" / name).exists(), name)
+        # real git reads the result: two parents, clean fsck, and the
+        # reflog carries git's own "commit (merge):" wording
+        self.assertEqual(len(git("log", "--pretty=%P", "-1",
+                                 cwd=py_repo).split()), 2)
+        assert_fsck_cleanish(py_repo)
+        logs = (py_repo / ".git" / "logs" / "HEAD").read_text()
+        self.assertIn("commit (merge): Merge branch 'feat'",
+                      logs.splitlines()[-1])
+        branch_log = (py_repo / ".git" / "logs" / "refs" / "heads" / "main"
+                      ).read_text()
+        self.assertIn("commit (merge): Merge branch 'feat'",
+                      branch_log.splitlines()[-1])
+
+    def test_continue_detached(self):
+        py_repo, git_repo = fresh_repos()
+        pcommit(py_repo, {"f.txt": "base\n"}, "A")
+        gcommit(git_repo, {"f.txt": "base\n"}, "A")
+        run("checkout", "-b", "feat", cwd=py_repo)
+        git("checkout", "-qb", "feat", cwd=git_repo, env=git_env())
+        pcommit(py_repo, {"f.txt": "theirs\n"}, "B")
+        gcommit(git_repo, {"f.txt": "theirs\n"}, "B")
+        run("checkout", "main", cwd=py_repo)
+        git("checkout", "-q", "main", cwd=git_repo, env=git_env())
+        pcommit(py_repo, {"f.txt": "ours\n"}, "C")
+        gcommit(git_repo, {"f.txt": "ours\n"}, "C")
+        oid = pygit.current_head(str(py_repo))
+        run("checkout", oid, cwd=py_repo)  # detach
+        git("checkout", "-q", "--detach", "HEAD", cwd=git_repo,
+            env=git_env())
+        pr = run_raw("merge", "feat", cwd=py_repo)
+        gr = git_raw("merge", "feat", cwd=git_repo, env=git_env())
+        self.assertEqual((pr.returncode, gr.returncode), (1, 1))
+        resolve_both(py_repo, git_repo)
+        pr, gr = compare_continue(py_repo, git_repo)
+        self.assertIn("[detached HEAD", norm(pr.stdout))
+        _, message = commit_parents_and_message(
+            str(py_repo), pygit.current_head(str(py_repo)))
+        self.assertEqual(message, "Merge branch 'feat' into HEAD")
+
+    # -- resolving by deletion -------------------------------------------
+
+    def test_rm_resolves_add_add(self):
+        py_repo, git_repo = added_added()
+        pr = run_raw("rm", "g.txt", cwd=py_repo)
+        gr = git_raw("rm", "g.txt", cwd=git_repo, env=git_env())
+        self.assertEqual(pr.returncode, gr.returncode)
+        self.assertEqual(norm(pr.stdout), norm(gr.stdout))
+        self.assertEqual(pr.stderr, gr.stderr)
+        compare_continue(py_repo, git_repo)
+        self.assertFalse((py_repo / "g.txt").exists())
+
+    def test_rm_resolves_content_conflict(self):
+        # `rm` on an unmerged path stages the deletion as the
+        # resolution — for content conflicts too (an earlier probe
+        # misread a typo'd filename as a refusal; the oracle caught it)
+        py_repo, git_repo = conflicted()
+        pr = run_raw("rm", "f.txt", cwd=py_repo)
+        gr = git_raw("rm", "f.txt", cwd=git_repo, env=git_env())
+        self.assertEqual(pr.returncode, gr.returncode)
+        self.assertEqual(pr.returncode, 0)
+        self.assertEqual(norm(pr.stdout), norm(gr.stdout))
+        compare_continue(py_repo, git_repo)
+        self.assertFalse((py_repo / "f.txt").exists())
+
+    def test_add_stages_deletion(self):
+        # `add` on a deleted tracked file stages the deletion (real git
+        # does this too); during a merge it's how a content conflict is
+        # resolved by deletion
+        py_repo, git_repo = conflicted()
+        (py_repo / "f.txt").unlink()
+        (git_repo / "f.txt").unlink()
+        pr = run_raw("add", "f.txt", cwd=py_repo)
+        gr = git_raw("add", "f.txt", cwd=git_repo, env=git_env())
+        self.assertEqual(pr.returncode, gr.returncode)
+        self.assertEqual(py_git_index_paths(py_repo), set())
+        self.assertEqual(git("ls-files", cwd=git_repo,
+                             env=git_env()), "")
+        compare_continue(py_repo, git_repo)
+        # the tree is git's well-known empty tree
+        new = pygit.current_head(str(py_repo))
+        obj_type, payload = pygit.read_object(new, str(py_repo))
+        tree = [ln[5:] for ln in payload.decode().splitlines()
+                if ln.startswith("tree ")][0]
+        self.assertEqual(tree,
+                         "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+        assert_fsck_cleanish(py_repo)
+
+
+def py_git_index_paths(repo):
+    return set(pygit.read_index(str(repo)))
+
+
+def assert_fsck_cleanish(repo):
+    """fsck reports no corruption; the only dangling objects allowed
+    are the conflict-marker blobs pygit writes eagerly at conflict
+    time (real git never object-izes the conflicted worktree content
+    until it is staged — a known, harmless v0.8 artifact)."""
+    out = git("fsck", cwd=repo, env=git_env())
+    bad = [l for l in out.splitlines() if not l.startswith("dangling ")]
+    assert not bad, bad
+
+
 if __name__ == "__main__":
     unittest.main()
